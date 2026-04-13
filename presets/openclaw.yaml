@@ -1,0 +1,12 @@
+name: openclaw
+description: "OpenClaw agent runtime + workspace"
+paths:
+  - ~/.openclaw
+exclude:
+  - "*/browser/*"
+  - "*/delivery-queue/*"
+  - "*/media/*"
+  - "*.log"
+notes: |
+  Does NOT include your workspace directory — add it as a custom path in your config.
+  The workspace (~/your-workspace) contains MEMORY.md, skills, and project files.

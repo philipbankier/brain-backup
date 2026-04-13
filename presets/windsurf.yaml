@@ -1,0 +1,9 @@
+name: windsurf
+description: "Windsurf/Codeium Cascade memories"
+paths:
+  - ~/.codeium/windsurf/memories
+exclude: []
+notes: |
+  Auto-generated memories + global_rules.md.
+  Workspace rules (.windsurf/rules/) live in project dirs — not covered here.
+  Add project dirs as custom paths if you want workspace rules backed up.

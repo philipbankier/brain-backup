@@ -1,0 +1,1119 @@
+#!/usr/bin/env bash
+# brain-backup — Opinionated restic wrapper for AI agent memory backup
+# Version: 0.1.0
+set -euo pipefail
+
+readonly BB_VERSION="0.1.0"
+
+# Detect script directory (dev mode vs installed mode)
+BB_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [[ -d "$BB_SCRIPT_DIR/lib" ]]; then
+  # Dev mode: running from repo checkout
+  BB_LIB_DIR="$BB_SCRIPT_DIR/lib"
+  BB_PRESET_DIR="$BB_SCRIPT_DIR/presets"
+else
+  # Installed mode
+  BB_LIB_DIR="$HOME/.local/share/brain-backup/lib"
+  BB_PRESET_DIR="$HOME/.local/share/brain-backup/presets"
+fi
+
+# Source libs
+source "$BB_LIB_DIR/output.sh"
+source "$BB_LIB_DIR/config.sh"
+source "$BB_LIB_DIR/presets.sh"
+
+# Override preset dir from lib detection
+BB_PRESET_DIR="${BB_PRESET_DIR}"
+
+# Global flags
+BB_JSON_MODE="false"
+BB_QUIET_MODE="false"
+BB_VERBOSE_MODE="false"
+BB_CONFIG_FILE="$HOME/.config/brain-backup/config.yaml"
+
+# Export for libs
+export BB_JSON_MODE BB_QUIET_MODE BB_VERBOSE_MODE BB_CONFIG_FILE
+
+#######################################
+# Usage / help
+#######################################
+bb::usage() {
+  cat <<EOF
+brain-backup v${BB_VERSION} — Opinionated restic wrapper for AI agent memory backup
+
+Usage: brain-backup <command> [flags]
+
+Commands:
+  init                 Create config and initialize restic repository
+  snapshot             Take an incremental backup
+  restore              Restore a snapshot
+  list                 Show snapshot history
+  status               Show backup health
+  prune                Apply retention policy
+  schedule             Install/remove launchd scheduled backups
+  doctor               Check dependencies and config
+  config               Show resolved configuration
+
+Global flags:
+  --config FILE        Path to config file (default: ~/.config/brain-backup/config.yaml)
+  --json               Machine-readable JSON output
+  --quiet              Suppress all output except errors
+  --verbose            Show restic's raw output
+  --help               Show this help
+  --version            Print version and exit
+
+Run 'brain-backup <command> --help' for command-specific usage.
+EOF
+}
+
+bb::version() {
+  echo "brain-backup v${BB_VERSION}"
+}
+
+#######################################
+# Check required dependencies
+# Returns: 0 if all present, 2 if missing
+#######################################
+bb::check_deps() {
+  local missing=0
+  for cmd in restic yq jq; do
+    if ! command -v "$cmd" &>/dev/null; then
+      bb::output::error "$cmd not found. Install: brew install $cmd"
+      missing=1
+    fi
+  done
+  if [[ $missing -eq 1 ]]; then
+    return 2
+  fi
+  return 0
+}
+
+#######################################
+# COMMAND: init
+#######################################
+cmd_init() {
+  local backend="" bucket="" profile_input=""
+
+  # Parse command flags
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --backend)
+        backend="$2"; shift 2 ;;
+      --help)
+        cat <<EOF
+Usage: brain-backup init [--backend b2|s3|local]
+
+Create config and initialize restic repository.
+Interactive if flags not provided.
+
+Flags:
+  --backend   Backend type: b2, s3, or local
+EOF
+        return 0 ;;
+      *)
+        bb::output::error "Unknown flag: $1. See: brain-backup init --help"
+        return 1 ;;
+    esac
+  done
+
+  # Check if config already exists
+  if [[ -f "$BB_CONFIG_FILE" ]]; then
+    echo "Config exists at $BB_CONFIG_FILE. Overwrite? [y/N]"
+    local answer
+    read -r answer
+    if [[ "$answer" != "y" && "$answer" != "Y" ]]; then
+      bb::output::print "Aborted."
+      return 0
+    fi
+  fi
+
+  # Ask backend if not provided
+  if [[ -z "$backend" ]]; then
+    echo "Backend? [b2/s3/local]"
+    read -r backend
+  fi
+
+  # Validate backend
+  if [[ "$backend" != "b2" && "$backend" != "s3" && "$backend" != "local" ]]; then
+    bb::output::error "Invalid backend: $backend. Must be b2, s3, or local."
+    return 1
+  fi
+
+  local bucket_line="" path_line=""
+  if [[ "$backend" == "b2" || "$backend" == "s3" ]]; then
+    echo "Bucket name?"
+    read -r bucket
+    if [[ -z "$bucket" ]]; then
+      bb::output::error "Bucket name is required for $backend backend."
+      return 1
+    fi
+    bucket_line="  bucket: ${bucket}"
+    if [[ "$backend" == "s3" ]]; then
+      echo "Custom endpoint? (leave empty for AWS S3)"
+      read -r endpoint
+      if [[ -n "$endpoint" ]]; then
+        bucket_line="${bucket_line}
+  endpoint: ${endpoint}"
+      else
+        bucket_line="${bucket_line}
+  endpoint: \"\""
+      fi
+    fi
+  else
+    echo "Local repo path? (must be absolute)"
+    read -r local_path
+    if [[ -z "$local_path" || "$local_path" != /* ]]; then
+      bb::output::error "Local path must be absolute (start with /)."
+      return 1
+    fi
+    path_line="  path: ${local_path}"
+  fi
+
+  # Ask profiles
+  local available_presets
+  available_presets=$(bb::presets::list | tr '\n' ' ')
+  echo "Which agent profiles? (space-separated from: ${available_presets})"
+  read -r profile_input
+
+  if [[ -z "$profile_input" ]]; then
+    bb::output::error "At least one profile is required."
+    return 1
+  fi
+
+  # Validate presets exist
+  local profiles_yaml=""
+  for p in $profile_input; do
+    if ! bb::presets::exists "$p"; then
+      bb::output::error "Unknown preset: '${p}'. Available: ${available_presets}"
+      return 1
+    fi
+    profiles_yaml="${profiles_yaml}
+  - name: ${p}
+    preset: ${p}
+    paths: []
+    exclude: []
+    include: []"
+  done
+
+  # Build config
+  local repo_block="  backend: ${backend}"
+  if [[ -n "$bucket_line" ]]; then
+    repo_block="${repo_block}
+${bucket_line}"
+  fi
+  if [[ -n "$path_line" ]]; then
+    repo_block="${repo_block}
+${path_line}"
+  fi
+
+  local config_content="version: 1
+repository:
+${repo_block}
+profiles:${profiles_yaml}
+schedule:
+  interval: 3600
+retention:
+  hourly: 24
+  daily: 30
+  monthly: 12
+  yearly: 0
+"
+
+  # Create config dir
+  mkdir -p "$(dirname "$BB_CONFIG_FILE")"
+  chmod 700 "$(dirname "$BB_CONFIG_FILE")" 2>/dev/null || true
+
+  # Write config
+  echo "$config_content" > "$BB_CONFIG_FILE"
+  chmod 600 "$BB_CONFIG_FILE" 2>/dev/null || true
+
+  bb::output::print "Config written to $BB_CONFIG_FILE"
+
+  # Validate config
+  BB_CONFIG_FILE="$BB_CONFIG_FILE" bb::config::validate || return 1
+
+  # Check credentials
+  local cred_ok=true
+  if [[ -z "${RESTIC_PASSWORD:-}" ]]; then
+    bb::output::print "⚠️  RESTIC_PASSWORD not set. Add to ~/.zshenv:
+  export RESTIC_PASSWORD=\"your-encryption-password\""
+    cred_ok=false
+  fi
+
+  case "$backend" in
+    b2)
+      if [[ -z "${B2_ACCOUNT_ID:-}" || -z "${B2_ACCOUNT_KEY:-}" ]]; then
+        bb::output::print "⚠️  B2_ACCOUNT_ID and/or B2_ACCOUNT_KEY not set. Add to ~/.zshenv:
+  export B2_ACCOUNT_ID=\"your-id\"
+  export B2_ACCOUNT_KEY=\"your-key\""
+        cred_ok=false
+      fi
+      ;;
+    s3)
+      if [[ -z "${AWS_ACCESS_KEY_ID:-}" || -z "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+        bb::output::print "⚠️  AWS_ACCESS_KEY_ID and/or AWS_SECRET_ACCESS_KEY not set. Add to ~/.zshenv:
+  export AWS_ACCESS_KEY_ID=\"your-id\"
+  export AWS_SECRET_ACCESS_KEY=\"your-key\""
+        cred_ok=false
+      fi
+      ;;
+  esac
+
+  if [[ "$cred_ok" == "false" ]]; then
+    bb::output::print ""
+    bb::output::print "Set the above credentials, then run: brain-backup snapshot"
+    bb::output::print "The restic repo will be initialized on first snapshot."
+    return 0
+  fi
+
+  # Try to init restic repo
+  bb::config::set_restic_env || return 1
+
+  bb::output::print "Initializing restic repository..."
+  if restic init 2>&1; then
+    bb::output::print "✅ Ready. Run: brain-backup snapshot"
+  else
+    local rc=$?
+    # Repo may already exist — that's fine
+    if restic cat config &>/dev/null; then
+      bb::output::print "Repository already initialized. ✅ Ready. Run: brain-backup snapshot"
+    else
+      bb::output::error "Failed to initialize repository. Check credentials and backend config."
+      return $rc
+    fi
+  fi
+}
+
+#######################################
+# COMMAND: snapshot
+#######################################
+cmd_snapshot() {
+  local profile_filter="" dry_run="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --profile) profile_filter="$2"; shift 2 ;;
+      --dry-run) dry_run="true"; shift ;;
+      --json) BB_JSON_MODE="true"; export BB_JSON_MODE; shift ;;
+      --help)
+        cat <<EOF
+Usage: brain-backup snapshot [--profile NAME] [--dry-run] [--json]
+
+Take an incremental backup.
+
+Flags:
+  --profile NAME   Only back up this profile
+  --dry-run        Show what would run without executing
+  --json           JSON output
+EOF
+        return 0 ;;
+      *)
+        bb::output::error "Unknown flag: $1. See: brain-backup snapshot --help"
+        return 1 ;;
+    esac
+  done
+
+  bb::check_deps || return 2
+
+  local config
+  config=$(bb::config::load) || return 1
+  bb::config::validate || return 1
+  bb::config::set_restic_env || return 3
+
+  # Resolve profiles
+  local all_paths all_excludes
+  {
+    read -r all_paths
+    read -r all_excludes
+  } < <(bb::presets::resolve_all "$config" "$profile_filter")
+
+  # Filter to existing paths
+  local existing_paths
+  existing_paths=$(bb::presets::filter_existing "$all_paths")
+
+  local path_count
+  path_count=$(echo "$existing_paths" | jq 'length')
+
+  if [[ "$path_count" -eq 0 ]]; then
+    bb::output::error "No backup paths exist on disk. Nothing to back up."
+    return 5
+  fi
+
+  # Build restic command
+  local paths_args=()
+  while IFS= read -r p; do
+    paths_args+=("$p")
+  done < <(echo "$existing_paths" | jq -r '.[]')
+
+  local exclude_args=()
+  while IFS= read -r e; do
+    exclude_args+=("--exclude" "$e")
+  done < <(echo "$all_excludes" | jq -r '.[]')
+
+  # Get profile names for tags
+  local profile_names=""
+  local count
+  count=$(echo "$config" | yq eval '.profiles | length' -)
+  local i=0
+  while [[ $i -lt $count ]]; do
+    local name
+    name=$(echo "$config" | yq eval ".profiles[$i].name" -)
+    if [[ -n "$profile_filter" && "$name" != "$profile_filter" ]]; then
+      i=$((i + 1)); continue
+    fi
+    if [[ -n "$profile_names" ]]; then
+      profile_names="${profile_names},${name}"
+    else
+      profile_names="$name"
+    fi
+    i=$((i + 1))
+  done
+
+  local tag_args=("--tag" "brain-backup")
+  local IFS_OLD="$IFS"
+  IFS=','
+  for pn in $profile_names; do
+    [[ -n "$pn" ]] && tag_args+=("--tag" "$pn")
+  done
+  IFS="$IFS_OLD"
+
+  # Dry run
+  if [[ "$dry_run" == "true" ]]; then
+    local cmd_str="restic backup ${paths_args[*]}"
+    for e in "${exclude_args[@]}"; do cmd_str="$cmd_str $e"; done
+    for t in "${tag_args[@]}"; do cmd_str="$cmd_str $t"; done
+    cmd_str="$cmd_str --json"
+    bb::output::print "Would run: $cmd_str"
+    return 0
+  fi
+
+  # Run restic backup
+  local restic_output
+  restic_output=$(restic backup "${paths_args[@]}" "${exclude_args[@]}" "${tag_args[@]}" --json 2>/dev/null) || {
+    local rc=$?
+    bb::output::verbose "restic stderr: $restic_output"
+    bb::output::error "Restic backup failed. Run with --verbose for details."
+    return 4
+  }
+
+  # Extract the summary JSON (restic outputs multiple JSON lines; last one is summary)
+  local summary_json
+  summary_json=$(echo "$restic_output" | grep '"message_type":"summary"' | tail -1) || {
+    # Fallback: try last line if grep fails
+    summary_json=$(echo "$restic_output" | tail -1)
+  }
+  # Validate it's parseable JSON
+  echo "$summary_json" | jq '.' >/dev/null 2>&1 || {
+    bb::output::error "Unexpected restic output. Check restic version."
+    return 4
+  }
+
+  # Run forget with retention
+  local retention_flags
+  retention_flags=$(bb::config::retention_flags) || true
+  local forget_output
+  local pruned=0 kept=0
+
+  if [[ -n "$retention_flags" ]]; then
+    forget_output=$(restic forget $retention_flags --prune --tag "brain-backup" --json 2>&1) || {
+      bb::output::verbose "forget stderr: $forget_output"
+    }
+    if [[ -n "$forget_output" ]]; then
+      pruned=$(echo "$forget_output" | jq -r '. | if type == "array" then (.[] | select(.tags) | .tags) else . end' 2>/dev/null | wc -l | tr -d ' ')
+      # Try to get removed/kept from forget JSON
+      local removed_count
+      removed_count=$(echo "$forget_output" | jq -r '[.[].tags // empty] | length' 2>/dev/null || echo "0")
+      pruned=$(echo "$forget_output" | jq -r 'if type == "object" then (.remove | length) else 0 end' 2>/dev/null || echo "0")
+      kept=$(echo "$forget_output" | jq -r 'if type == "object" then (.keep | length) else 0 end' 2>/dev/null || echo "0")
+    fi
+  fi
+
+  bb::output::snapshot_summary "$summary_json" "$pruned" "$kept" "$profile_names"
+}
+
+#######################################
+# COMMAND: restore
+#######################################
+cmd_restore() {
+  local snapshot_id="" target="" dry_run="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --target) target="$2"; shift 2 ;;
+      --dry-run) dry_run="true"; shift ;;
+      --help)
+        cat <<EOF
+Usage: brain-backup restore <SNAPSHOT_ID|latest> [--target DIR] [--dry-run]
+
+Restore a snapshot.
+
+Arguments:
+  SNAPSHOT_ID   Snapshot ID or 'latest'
+
+Flags:
+  --target DIR  Restore to this directory (default: ~/brain-backup-restore-<timestamp>)
+  --dry-run     Show what would be restored
+EOF
+        return 0 ;;
+      -*)
+        bb::output::error "Unknown flag: $1. See: brain-backup restore --help"
+        return 1 ;;
+      *)
+        if [[ -z "$snapshot_id" ]]; then
+          snapshot_id="$1"
+        else
+          bb::output::error "Unexpected argument: $1"
+          return 1
+        fi
+        shift ;;
+    esac
+  done
+
+  if [[ -z "$snapshot_id" ]]; then
+    bb::output::error "Usage: brain-backup restore <SNAPSHOT_ID|latest> [--target DIR]"
+    return 1
+  fi
+
+  bb::check_deps || return 2
+  bb::config::set_restic_env || return 3
+
+  # Default target
+  if [[ -z "$target" ]]; then
+    target="$HOME/brain-backup-restore-$(date +%Y%m%d-%H%M%S)"
+  fi
+
+  bb::output::print "⚠️  This will write files to ${target}. It will NOT overwrite your current agent files."
+
+  local dry_flag=""
+  if [[ "$dry_run" == "true" ]]; then
+    dry_flag="--dry-run"
+  fi
+
+  if restic restore "$snapshot_id" --target "$target" $dry_flag 2>&1; then
+    bb::output::print "✅ Restored to ${target}. To use: cp -r ${target}/<agent-dir> ~/<agent-dir>"
+  else
+    local rc=$?
+    bb::output::error "Restore failed. Check snapshot ID and target directory."
+    return 4
+  fi
+}
+
+#######################################
+# COMMAND: list
+#######################################
+cmd_snapshot_list() {
+  local latest="" profile_filter=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --latest) latest="$2"; shift 2 ;;
+      --profile) profile_filter="$2"; shift 2 ;;
+      --json) BB_JSON_MODE="true"; export BB_JSON_MODE; shift ;;
+      --help)
+        cat <<EOF
+Usage: brain-backup list [--latest N] [--profile NAME] [--json]
+
+Show snapshot history.
+
+Flags:
+  --latest N      Show last N snapshots
+  --profile NAME  Filter by profile tag
+  --json          JSON output
+EOF
+        return 0 ;;
+      *)
+        bb::output::error "Unknown flag: $1. See: brain-backup list --help"
+        return 1 ;;
+    esac
+  done
+
+  bb::check_deps || return 2
+  bb::config::set_restic_env || return 3
+
+  local tag_args=("--tag" "brain-backup")
+  if [[ -n "$profile_filter" ]]; then
+    tag_args+=("--tag" "$profile_filter")
+  fi
+
+  local snapshots
+  snapshots=$(restic snapshots "${tag_args[@]}" --json 2>&1) || {
+    local rc=$?
+    bb::output::error "Failed to list snapshots."
+    return 4
+  }
+
+  # Filter to only brain-backup tagged
+  if [[ -n "$profile_filter" ]]; then
+    snapshots=$(echo "$snapshots" | jq --arg pf "$profile_filter" '[.[] | select(.tags | index($pf))]')
+  fi
+
+  # Apply --latest
+  if [[ -n "$latest" ]]; then
+    snapshots=$(echo "$snapshots" | jq --argjson n "$latest" '.[-$n:]')
+  fi
+
+  bb::output::snapshot_list "$snapshots"
+}
+
+#######################################
+# COMMAND: status
+#######################################
+cmd_status() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) BB_JSON_MODE="true"; export BB_JSON_MODE; shift ;;
+      --help)
+        cat <<EOF
+Usage: brain-backup status [--json]
+
+Show backup health.
+
+Flags:
+  --json   JSON output
+EOF
+        return 0 ;;
+      *)
+        bb::output::error "Unknown flag: $1. See: brain-backup status --help"
+        return 1 ;;
+    esac
+  done
+
+  bb::check_deps || return 2
+
+  local config
+  config=$(bb::config::load) || return 1
+
+  local backend bucket_val
+  backend=$(echo "$config" | yq eval '.repository.backend' -)
+  bucket_val=$(echo "$config" | yq eval '.repository.bucket // ""' -)
+
+  # Check repo reachable
+  local repo_reachable="false"
+  bb::config::set_restic_env &>/dev/null || true
+  if restic cat config &>/dev/null; then
+    repo_reachable="true"
+  fi
+
+  # Latest snapshot
+  local last_id="none" last_time="never" age_seconds=0 age_human="N/A" total_snapshots=0
+  if [[ "$repo_reachable" == "true" ]]; then
+    local snap_json
+    snap_json=$(restic snapshots --tag "brain-backup" --json 2>/dev/null || echo "[]")
+    total_snapshots=$(echo "$snap_json" | jq 'length')
+    local snap_count
+    snap_count=$total_snapshots
+    if [[ "$snap_count" -gt 0 ]]; then
+      # Get the LAST snapshot (most recent) — restic returns oldest-first
+      last_id=$(echo "$snap_json" | jq -r '.[-1].id[:8]')
+      last_time=$(echo "$snap_json" | jq -r '.[-1].time')
+      local now_iso
+      now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+      age_seconds=$(jq -n --arg t "$last_time" --arg n "$now_iso" '(($n | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) - ($t | split(".")[0] | strptime("%Y-%m-%dT%H:%M:%S") | mktime)) | if . < 0 then 0 else . end' 2>/dev/null || echo "0")
+      age_human=$(bb::output::human_age "$age_seconds" 2>/dev/null || echo "N/A")
+    fi
+  fi
+
+  # Repo stats
+  local total_stored=0 total_stored_human="N/A"
+  if [[ "$repo_reachable" == "true" ]]; then
+    local stats_json
+    stats_json=$(restic stats --json 2>/dev/null || echo "{}")
+    total_stored=$(echo "$stats_json" | jq -r '.total_size // 0')
+    total_stored_human=$(bb::output::human_bytes "$total_stored" 2>/dev/null || echo "N/A")
+  fi
+
+  # Schedule status
+  local schedule_installed="false" interval_seconds=3600 interval_human="N/A"
+  local plist_path="$HOME/Library/LaunchAgents/com.brain-backup.plist"
+  if [[ -f "$plist_path" ]]; then
+    schedule_installed="true"
+    interval_seconds=$(echo "$config" | yq eval '.schedule.interval // 3600' -)
+    local interval_h=$((interval_seconds / 3600))
+    interval_human="every ${interval_h} hour(s)"
+  fi
+
+  # Build JSON
+  local status_json
+  status_json=$(jq -n \
+    --argjson reachable "$repo_reachable" \
+    --arg backend "$backend" \
+    --arg bucket "$bucket_val" \
+    --arg last_id "$last_id" \
+    --arg last_time "$last_time" \
+    --argjson age_secs "$age_seconds" \
+    --arg age_human "$age_human" \
+    --argjson total_snapshots "$total_snapshots" \
+    --argjson total_stored "$total_stored" \
+    --arg total_stored_human "$total_stored_human" \
+    --argjson sched_installed "$schedule_installed" \
+    --argjson interval_secs "$interval_seconds" \
+    --arg interval_human "$interval_human" \
+    '{
+      repo_reachable: $reachable,
+      backend: $backend,
+      bucket: $bucket,
+      last_snapshot: {
+        id: $last_id,
+        time: $last_time,
+        age_seconds: $age_secs,
+        age_human: $age_human
+      },
+      total_snapshots: $total_snapshots,
+      total_stored_bytes: $total_stored,
+      total_stored_human: $total_stored_human,
+      schedule: {
+        installed: $sched_installed,
+        interval_seconds: $interval_secs,
+        interval_human: $interval_human
+      }
+    }')
+
+  bb::output::status_summary "$status_json"
+}
+
+#######################################
+# COMMAND: prune
+#######################################
+cmd_prune() {
+  local dry_run="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --dry-run) dry_run="true"; shift ;;
+      --help)
+        cat <<EOF
+Usage: brain-backup prune [--dry-run]
+
+Apply retention policy from config.
+
+Flags:
+  --dry-run   Show what would be pruned
+EOF
+        return 0 ;;
+      *)
+        bb::output::error "Unknown flag: $1. See: brain-backup prune --help"
+        return 1 ;;
+    esac
+  done
+
+  bb::check_deps || return 2
+  bb::config::set_restic_env || return 3
+
+  local retention_flags
+  retention_flags=$(bb::config::retention_flags)
+  if [[ -z "$retention_flags" ]]; then
+    bb::output::print "No retention policy configured. Nothing to prune."
+    return 0
+  fi
+
+  local dry_flag=""
+  if [[ "$dry_run" == "true" ]]; then
+    dry_flag="--dry-run"
+  fi
+
+  local output
+  output=$(restic forget $retention_flags $dry_flag --prune --tag "brain-backup" --json 2>&1) || {
+    local rc=$?
+    bb::output::error "Prune failed."
+    return 4
+  }
+
+  local removed
+  removed=$(echo "$output" | jq -r 'if type == "object" then (.remove | length) else 0 end' 2>/dev/null || echo "0")
+
+  if [[ "$removed" -eq 0 ]]; then
+    bb::output::print "Nothing to prune."
+  else
+    bb::output::print "Removed ${removed} snapshot(s)."
+  fi
+}
+
+#######################################
+# COMMAND: schedule
+#######################################
+cmd_schedule() {
+  local subcmd="${1:-}"
+  shift || true
+
+  case "$subcmd" in
+    install)
+      cmd_schedule_install "$@" ;;
+    remove)
+      cmd_schedule_remove "$@" ;;
+    status)
+      cmd_schedule_status "$@" ;;
+    "")
+      bb::output::error "Usage: brain-backup schedule <install|remove|status>"
+      return 1 ;;
+    --help)
+      cat <<EOF
+Usage: brain-backup schedule <install|remove|status>
+
+Manage launchd scheduled backups.
+
+Subcommands:
+  install   Install launchd job
+  remove    Remove launchd job
+  status    Show schedule status
+EOF
+      return 0 ;;
+    *)
+      bb::output::error "Unknown subcommand: $subcmd. Use: install, remove, or status"
+      return 1 ;;
+  esac
+}
+
+cmd_schedule_install() {
+  local plist_path="$HOME/Library/LaunchAgents/com.brain-backup.plist"
+
+  if [[ -f "$plist_path" ]]; then
+    bb::output::error "Schedule already installed. Run: brain-backup schedule remove first, then install again."
+    return 1
+  fi
+
+  local config
+  config=$(bb::config::load) || return 1
+
+  local interval
+  interval=$(echo "$config" | yq eval '.schedule.interval // 3600' -)
+
+  # Find script location
+  local script_path
+  if [[ -L "$HOME/.local/bin/brain-backup" ]]; then
+    script_path="$(cd "$(dirname "$HOME/.local/bin/brain-backup")" && pwd)/brain-backup"
+  else
+    script_path="$BB_SCRIPT_DIR/brain-backup"
+    # If running from dev, use the dev script
+    if [[ ! -f "$script_path" ]]; then
+      script_path="$HOME/.local/bin/brain-backup"
+    fi
+  fi
+
+  # Determine install_dir for plist
+  local install_dir
+  install_dir="$(dirname "$script_path")"
+
+  # Generate plist from template
+  local template
+  if [[ -f "$BB_SCRIPT_DIR/launchd/com.brain-backup.plist.template" ]]; then
+    template=$(cat "$BB_SCRIPT_DIR/launchd/com.brain-backup.plist.template")
+  else
+    template=$(cat "$HOME/.local/share/brain-backup/launchd/com.brain-backup.plist.template" 2>/dev/null) || {
+      bb::output::error "plist template not found."
+      return 1
+    }
+  fi
+
+  # Substitute template vars
+  local plist_content
+  plist_content=$(echo "$template" | \
+    sed "s|{{INSTALL_DIR}}|${install_dir}|g" | \
+    sed "s|{{INTERVAL_SECONDS}}|${interval}|g" | \
+    sed "s|{{HOME}}|${HOME}|g")
+
+  # Write plist
+  mkdir -p "$(dirname "$plist_path")"
+  echo "$plist_content" > "$plist_path"
+
+  # Load with launchctl
+  local uid
+  uid=$(id -u)
+  launchctl bootstrap "gui/${uid}" "$plist_path" 2>&1 || {
+    # Already loaded? Try bootout + bootstrap
+    launchctl bootout "gui/${uid}/com.brain-backup" 2>/dev/null || true
+    launchctl bootstrap "gui/${uid}" "$plist_path" 2>&1
+  }
+
+  local interval_h=$((interval / 3600))
+  bb::output::print "✅ Scheduled every ${interval_h} hour(s). Next run at login or after interval."
+}
+
+cmd_schedule_remove() {
+  local plist_path="$HOME/Library/LaunchAgents/com.brain-backup.plist"
+  local uid
+  uid=$(id -u)
+
+  if [[ ! -f "$plist_path" ]]; then
+    bb::output::print "No schedule found."
+    return 0
+  fi
+
+  launchctl bootout "gui/${uid}/com.brain-backup" 2>/dev/null || true
+  rm -f "$plist_path"
+  bb::output::print "✅ Schedule removed."
+}
+
+cmd_schedule_status() {
+  local plist_path="$HOME/Library/LaunchAgents/com.brain-backup.plist"
+
+  if [[ -f "$plist_path" ]]; then
+    local interval
+    interval=$(yq eval '.StartInterval' "$plist_path" 2>/dev/null || echo "unknown")
+    local interval_h=$((interval / 3600))
+    bb::output::print "Schedule: ✅ installed (every ${interval_h} hour(s))"
+
+    # Check last run from log
+    if [[ -f /tmp/brain-backup.log ]]; then
+      local last_line
+      last_line=$(tail -1 /tmp/brain-backup.log 2>/dev/null || echo "")
+      if [[ -n "$last_line" ]]; then
+        bb::output::print "Last run output: $last_line"
+      fi
+    fi
+  else
+    bb::output::print "Schedule: not installed"
+  fi
+}
+
+#######################################
+# COMMAND: doctor
+#######################################
+cmd_doctor() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) BB_JSON_MODE="true"; export BB_JSON_MODE; shift ;;
+      --help)
+        cat <<EOF
+Usage: brain-backup doctor [--json]
+
+Check dependencies, config, credentials, repo, paths, and schedule.
+EOF
+        return 0 ;;
+      *)
+        bb::output::error "Unknown flag: $1. See: brain-backup doctor --help"
+        return 1 ;;
+    esac
+  done
+
+  # Collect check results as JSON lines, then join with jq -s
+  local check_lines=""
+  local all_pass=true
+  local critical_fail=false
+  local config_ok=true
+
+  # Helper to append a JSON line
+  _dc() { check_lines="${check_lines}${1}\n"; }
+
+  # 1. bash version
+  local bash_ver
+  bash_ver=$(bash --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "0.0.0")
+  local bash_major bash_minor
+  bash_major=$(echo "$bash_ver" | cut -d. -f1)
+  bash_minor=$(echo "$bash_ver" | cut -d. -f2)
+  if [[ "$bash_major" -gt 3 ]] || { [[ "$bash_major" -eq 3 ]] && [[ "$bash_minor" -ge 2 ]]; }; then
+    _dc "{\"name\":\"bash\",\"status\":\"pass\",\"version\":\"${bash_ver}\",\"required\":\"3.2+\"}"
+  else
+    _dc "{\"name\":\"bash\",\"status\":\"fail\",\"version\":\"${bash_ver}\",\"required\":\"3.2+\"}"
+    all_pass=false; critical_fail=true
+  fi
+
+  # 2-4. Deps: restic, yq, jq
+  local _dn _dv _dr _dcmd
+  for _de in "restic|restic version|0.16+" "yq|yq --version|4.0+" "jq|jq --version|1.6+"; do
+    _dn="${_de%%|*}"; _dr="${_de##*|}"; _dcmd="${_de#*|}"; _dcmd="${_dcmd%|*}"
+    _dv=$(eval "$_dcmd" 2>/dev/null | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)
+    if command -v "$_dn" &>/dev/null && [[ -n "$_dv" ]]; then
+      _dc "{\"name\":\"${_dn}\",\"status\":\"pass\",\"version\":\"${_dv}\",\"required\":\"${_dr}\"}"
+    else
+      _dc "{\"name\":\"${_dn}\",\"status\":\"fail\",\"detail\":\"not found\",\"required\":\"${_dr}\"}"
+      all_pass=false; critical_fail=true
+    fi
+  done
+
+  # 5 & 6. Config file + schema
+  if [[ -f "$BB_CONFIG_FILE" ]]; then
+    if bb::config::validate &>/dev/null; then
+      _dc '{"name":"config","status":"pass","detail":"valid"}'
+    else
+      _dc '{"name":"config","status":"fail","detail":"schema invalid"}'
+      all_pass=false; config_ok=false
+    fi
+  else
+    _dc '{"name":"config","status":"fail","detail":"file not found"}'
+    all_pass=false; config_ok=false
+  fi
+
+  # 7. RESTIC_PASSWORD
+  if [[ -n "${RESTIC_PASSWORD:-}" ]]; then
+    _dc '{"name":"credentials","status":"pass","detail":"RESTIC_PASSWORD set"}'
+  else
+    _dc '{"name":"credentials","status":"fail","detail":"RESTIC_PASSWORD not set"}'
+    all_pass=false
+  fi
+
+  # 8-10. Only if config is valid
+  if [[ "$config_ok" == "true" ]]; then
+    # 8. Backend credentials
+    local backend
+    backend=$(bb::config::get '.repository.backend' 2>/dev/null || echo "")
+    case "$backend" in
+      b2)
+        if [[ -n "${B2_ACCOUNT_ID:-}" && -n "${B2_ACCOUNT_KEY:-}" ]]; then
+          _dc '{"name":"backend_credentials","status":"pass","detail":"B2 credentials set"}'
+        else
+          _dc '{"name":"backend_credentials","status":"fail","detail":"B2 credentials missing"}'
+          all_pass=false
+        fi ;;
+      s3)
+        if [[ -n "${AWS_ACCESS_KEY_ID:-}" && -n "${AWS_SECRET_ACCESS_KEY:-}" ]]; then
+          _dc '{"name":"backend_credentials","status":"pass","detail":"AWS credentials set"}'
+        else
+          _dc '{"name":"backend_credentials","status":"fail","detail":"AWS credentials missing"}'
+          all_pass=false
+        fi ;;
+      local)
+        _dc '{"name":"backend_credentials","status":"pass","detail":"local backend (no credentials needed)"}' ;;
+    esac
+
+    # 9. Repo reachable
+    bb::config::set_restic_env &>/dev/null || true
+    if restic cat config &>/dev/null; then
+      _dc '{"name":"repo","status":"pass","detail":"reachable"}'
+    else
+      _dc '{"name":"repo","status":"fail","detail":"unreachable"}'
+      all_pass=false
+    fi
+
+    # 10. Profile paths
+    local config_yaml
+    config_yaml=$(bb::config::load 2>/dev/null) || config_yaml=""
+    if [[ -n "$config_yaml" ]]; then
+      local resolved_paths resolved_existing
+      resolved_paths=$(bb::presets::resolve_all "$config_yaml" "" 2>/dev/null | head -1 || echo "[]")
+      resolved_existing=$(bb::presets::filter_existing "$resolved_paths" 2>/dev/null || echo "[]")
+      local total_n exist_n
+      total_n=$(echo "$resolved_paths" | jq 'length' 2>/dev/null || echo "0")
+      exist_n=$(echo "$resolved_existing" | jq 'length' 2>/dev/null || echo "0")
+      if [[ "$exist_n" -gt 0 ]]; then
+        _dc "{\"name\":\"paths\",\"status\":\"pass\",\"detail\":\"${exist_n}/${total_n} profiles have existing paths\"}"
+      else
+        _dc "{\"name\":\"paths\",\"status\":\"fail\",\"detail\":\"${exist_n}/${total_n} profiles have existing paths\"}"
+        all_pass=false
+      fi
+    fi
+  fi
+
+  # 11. Schedule status
+  local plist_path="$HOME/Library/LaunchAgents/com.brain-backup.plist"
+  if [[ -f "$plist_path" ]]; then
+    local sched_int
+    sched_int=$(plutil -extract StartInterval raw "$plist_path" 2>/dev/null || echo "unknown")
+    _dc "{\"name\":\"schedule\",\"status\":\"pass\",\"detail\":\"installed, every ${sched_int}s\"}"
+  else
+    _dc '{"name":"schedule","status":"fail","detail":"not installed"}'
+  fi
+
+  # Build final JSON array from collected lines
+  local checks
+  checks=$(printf '%b' "$check_lines" | tr -d '\000-\037' | jq -s '.')
+  local results
+  results=$(jq -n --argjson checks "$checks" --argjson all_pass "$all_pass" '{checks: $checks, all_pass: $all_pass}')
+
+  bb::output::doctor_results "$results"
+
+  if [[ "$critical_fail" == "true" ]]; then
+    return 2
+  elif [[ "$all_pass" == "false" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+#######################################
+# COMMAND: config
+#######################################
+cmd_config() {
+  local path_key=""
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --path) path_key="$2"; shift 2 ;;
+      --help)
+        cat <<EOF
+Usage: brain-backup config [--path KEY]
+
+Show resolved configuration.
+
+Flags:
+  --path KEY   Extract a single config value (yq path, e.g. .repository.backend)
+EOF
+        return 0 ;;
+      *)
+        bb::output::error "Unknown flag: $1. See: brain-backup config --help"
+        return 1 ;;
+    esac
+  done
+
+  bb::check_deps || return 2
+
+  if [[ -n "$path_key" ]]; then
+    bb::config::get "$path_key"
+  else
+    bb::config::load
+  fi
+}
+
+#######################################
+# Main entry point — parse globals and route to commands
+#######################################
+main() {
+  local command=""
+
+  if [[ $# -eq 0 ]]; then
+    bb::usage
+    exit 0
+  fi
+
+  # Parse global flags first
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --config)
+        BB_CONFIG_FILE="$2"
+        export BB_CONFIG_FILE
+        shift 2 ;;
+      --json)
+        BB_JSON_MODE="true"
+        export BB_JSON_MODE
+        shift ;;
+      --quiet)
+        BB_QUIET_MODE="true"
+        export BB_QUIET_MODE
+        shift ;;
+      --verbose)
+        BB_VERBOSE_MODE="true"
+        export BB_VERBOSE_MODE
+        shift ;;
+      --version)
+        bb::version
+        exit 0 ;;
+      --help)
+        bb::usage
+        exit 0 ;;
+      --*)
+        echo "Unknown flag: $1. See: brain-backup --help" >&2
+        exit 1 ;;
+      *)
+        command="$1"
+        shift
+        break ;;
+    esac
+  done
+
+  # Route to command
+  case "$command" in
+    init)      cmd_init "$@" ;;
+    snapshot)  cmd_snapshot "$@" ;;
+    restore)   cmd_restore "$@" ;;
+    list)      cmd_snapshot_list "$@" ;;
+    status)    cmd_status "$@" ;;
+    prune)     cmd_prune "$@" ;;
+    schedule)  cmd_schedule "$@" ;;
+    doctor)    cmd_doctor "$@" ;;
+    config)    cmd_config "$@" ;;
+    *)
+      bb::output::error "Unknown command: $command. Run: brain-backup --help"
+      exit 1 ;;
+  esac
+}
+
+main "$@"

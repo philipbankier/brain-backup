@@ -1,0 +1,11 @@
+name: hermes
+description: "Hermes Agent (Nous Research) runtime"
+paths:
+  - ~/.hermes
+exclude:
+  - "*/logs/*"
+  - "*/sessions/*"
+notes: |
+  Core memory: ~/.hermes/memories/MEMORY.md and ~/.hermes/memories/USER.md
+  These are tiny (2.2k + 1.4k chars) but critical.
+  Skills, config, SOUL.md, and cron jobs are all included.

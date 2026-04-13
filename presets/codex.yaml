@@ -1,0 +1,9 @@
+name: codex
+description: "Codex (OpenAI) agent runtime"
+paths:
+  - ~/.codex
+exclude:
+  - "*/log/*"
+  - "*/tmp/*"
+notes: |
+  Includes: auth.json, config.toml, history.jsonl, sessions/, skills/

@@ -1,0 +1,13 @@
+name: claude-code
+description: "Claude Code (Anthropic) runtime"
+paths:
+  - ~/.claude
+exclude:
+  - "*/cache/*"
+  - "*/debug/*"
+  - "*/downloads/*"
+  - "*/CachedData/*"
+  - "*/Code Cache/*"
+notes: |
+  Includes: history.jsonl, settings, projects/, plans/, file-history/, sessions/
+  Does NOT include per-project .claude/ dirs — add project roots to custom paths.
