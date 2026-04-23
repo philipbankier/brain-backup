@@ -291,15 +291,20 @@ bb::output::doctor_results() {
   if [[ "$BB_JSON_MODE" == "true" ]]; then
     echo "$results" | jq '.'
   else
-    echo "$results" | jq -r '.checks[] | if .status == "pass" then "✅ \(.name): \(.detail // .version // "ok")" else "❌ \(.name): \(.detail // "failed")" end'
-    local all_pass
+    local total passed failed all_pass
+    total=$(echo "$results" | jq -r '.total // (.checks | length)')
+    passed=$(echo "$results" | jq -r '.passed // ([.checks[] | select(.status == "pass")] | length)')
+    failed=$(echo "$results" | jq -r '.failed // ([.checks[] | select(.status == "fail")] | length)')
     all_pass=$(echo "$results" | jq -r '.all_pass')
+
+    echo ""
+    echo "$results" | jq -r '.checks[] | if .status == "pass" then "  ✅ \(.name): \(.detail // .version // "ok")" else "  ❌ \(.name): \(.detail // "failed")" end'
+    echo ""
     if [[ "$all_pass" == "true" ]]; then
-      bb::output::print ""
-      bb::output::print "All checks passed ✅"
+      echo "  Health Check: PASS (${passed}/${total}) ✅"
     else
-      bb::output::print ""
-      bb::output::print "Some checks failed ❌"
+      echo "  Health Check: FAIL (${passed}/${total} passed, ${failed} failed) ❌"
     fi
+    echo ""
   fi
 }

@@ -69,11 +69,11 @@ bb::config::validate() {
   local config
   config=$(bb::config::load) || return 1
 
-  # Rule 1: version must be 1
+  # Rule 1: version must be 1 or 2
   local version
   version=$(echo "$config" | yq eval '.version' -)
-  if [[ "$version" != "1" ]]; then
-    bb::output::error "Config missing or invalid: version (must be 1)"
+  if [[ "$version" != "1" && "$version" != "2" ]]; then
+    bb::output::error "Config missing or invalid: version (must be 1 or 2)"
     return 1
   fi
 
