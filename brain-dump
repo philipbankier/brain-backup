@@ -3,7 +3,7 @@
 # Version: 0.1.0
 set -euo pipefail
 
-readonly BB_VERSION="0.1.0"
+readonly BB_VERSION="0.2.0"
 
 # Detect script directory (dev mode vs installed mode)
 BB_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,6 +21,7 @@ fi
 source "$BB_LIB_DIR/output.sh"
 source "$BB_LIB_DIR/config.sh"
 source "$BB_LIB_DIR/presets.sh"
+source "$BB_LIB_DIR/telemetry.sh"
 
 # Override preset dir from lib detection
 BB_PRESET_DIR="${BB_PRESET_DIR}"
@@ -29,7 +30,7 @@ BB_PRESET_DIR="${BB_PRESET_DIR}"
 BB_JSON_MODE="false"
 BB_QUIET_MODE="false"
 BB_VERBOSE_MODE="false"
-BB_CONFIG_FILE="$HOME/.config/brain-backup/config.yaml"
+BB_CONFIG_FILE="$HOME/.config/brain-dump/config.yaml"
 
 # Export for libs
 export BB_JSON_MODE BB_QUIET_MODE BB_VERBOSE_MODE BB_CONFIG_FILE
@@ -51,7 +52,9 @@ Commands:
   status               Show backup health
   prune                Apply retention policy
   schedule             Install/remove launchd scheduled backups
-  doctor               Check dependencies and config
+  doctor               Check dependencies, config, and health
+  telemetry            Show backup telemetry and analytics
+  errors               Show quarantined errors
   config               Show resolved configuration
 
 Global flags:
@@ -388,11 +391,18 @@ EOF
   fi
 
   # Run restic backup
+  local start_time
+  start_time=$(date +%s)
   local restic_output
   restic_output=$(restic backup "${paths_args[@]}" "${exclude_args[@]}" "${tag_args[@]}" --json 2>/dev/null) || {
     local rc=$?
+    local end_time
+    end_time=$(date +%s)
+    local duration=$((end_time - start_time))
     bb::output::verbose "restic stderr: $restic_output"
     bb::output::error "Restic backup failed. Run with --verbose for details."
+    bb::telemetry::record_snapshot "unknown" "$duration" 0 0 0 0 0 "$rc" "$profile_names" 0
+    bb::telemetry::record_error "snapshot" "Restic backup failed (exit $rc)" "$rc"
     return 4
   }
 
@@ -429,6 +439,23 @@ EOF
   fi
 
   bb::output::snapshot_summary "$summary_json" "$pruned" "$kept" "$profile_names"
+
+  # Record telemetry
+  local end_time
+  end_time=$(date +%s)
+  local duration=$((end_time - start_time))
+  local t_snap_id t_files_new t_files_changed t_files_unmod t_bytes_added t_bytes_stored
+  t_snap_id=$(echo "$summary_json" | jq -r '.snapshot_id // "unknown"')
+  t_files_new=$(echo "$summary_json" | jq -r '.files_new // 0')
+  t_files_changed=$(echo "$summary_json" | jq -r '.files_changed // 0')
+  t_files_unmod=$(echo "$summary_json" | jq -r '.files_unmodified // 0')
+  t_bytes_added=$(echo "$summary_json" | jq -r '.data_added // 0')
+  t_bytes_stored=$(echo "$summary_json" | jq -r '.total_bytes_processed // 0')
+  bb::telemetry::record_snapshot "$t_snap_id" "$duration" "$t_files_new" "$t_files_changed" "$t_files_unmod" "$t_bytes_added" "$t_bytes_stored" 0 "$profile_names" "$pruned"
+
+  # Clean up old telemetry (30-day retention)
+  bb::telemetry::cleanup 30
+  bb::telemetry::cleanup_errors 30
 }
 
 #######################################
@@ -719,7 +746,9 @@ EOF
   }
 
   local removed
-  removed=$(echo "$output" | jq -r 'if type == "object" then (.remove | length) else 0 end' 2>/dev/null || echo "0")
+  removed=$(echo "$output" | jq -r 'if type == "object" then (.remove | length) else 0 end' 2>/dev/null | tr -d '\n' | head -1 || echo "0")
+  # Ensure removed is a clean integer
+  removed=$(echo "$removed" | grep -oE '^[0-9]+' || echo "0")
 
   if [[ "$removed" -eq 0 ]]; then
     bb::output::print "Nothing to prune."
@@ -876,7 +905,17 @@ cmd_doctor() {
         cat <<EOF
 Usage: brain-dump doctor [--json]
 
-Check dependencies, config, credentials, repo, paths, and schedule.
+Run 10-point health check:
+  1. bash version
+  2. restic installed
+  3. yq installed
+  4. jq installed
+  5. config file valid
+  6. encryption password set
+  7. backend credentials
+  8. repository reachable
+  9. profile paths exist
+  10. schedule installed + recent backup
 EOF
         return 0 ;;
       *)
@@ -885,7 +924,7 @@ EOF
     esac
   done
 
-  # Collect check results as JSON lines, then join with jq -s
+  # Collect check results as JSON lines
   local check_lines=""
   local all_pass=true
   local critical_fail=false
@@ -920,7 +959,7 @@ EOF
     fi
   done
 
-  # 5 & 6. Config file + schema
+  # 5. Config file
   if [[ -f "$BB_CONFIG_FILE" ]]; then
     if bb::config::validate &>/dev/null; then
       _dc '{"name":"config","status":"pass","detail":"valid"}'
@@ -929,21 +968,21 @@ EOF
       all_pass=false; config_ok=false
     fi
   else
-    _dc '{"name":"config","status":"fail","detail":"file not found"}'
+    _dc '{"name":"config","status":"fail","detail":"file not found at ~/.config/brain-dump/config.yaml"}'
     all_pass=false; config_ok=false
   fi
 
-  # 7. RESTIC_PASSWORD
+  # 6. RESTIC_PASSWORD
   if [[ -n "${RESTIC_PASSWORD:-}" ]]; then
-    _dc '{"name":"credentials","status":"pass","detail":"RESTIC_PASSWORD set"}'
+    _dc '{"name":"encryption","status":"pass","detail":"RESTIC_PASSWORD set"}'
   else
-    _dc '{"name":"credentials","status":"fail","detail":"RESTIC_PASSWORD not set"}'
+    _dc '{"name":"encryption","status":"fail","detail":"RESTIC_PASSWORD not set. Add to ~/.zshenv"}'
     all_pass=false
   fi
 
-  # 8-10. Only if config is valid
+  # 7-10. Only if config is valid
   if [[ "$config_ok" == "true" ]]; then
-    # 8. Backend credentials
+    # 7. Backend credentials
     local backend
     backend=$(bb::config::get '.repository.backend' 2>/dev/null || echo "")
     case "$backend" in
@@ -951,7 +990,7 @@ EOF
         if [[ -n "${B2_ACCOUNT_ID:-}" && -n "${B2_ACCOUNT_KEY:-}" ]]; then
           _dc '{"name":"backend_credentials","status":"pass","detail":"B2 credentials set"}'
         else
-          _dc '{"name":"backend_credentials","status":"fail","detail":"B2 credentials missing"}'
+          _dc '{"name":"backend_credentials","status":"fail","detail":"B2 credentials missing. Add B2_ACCOUNT_ID and B2_ACCOUNT_KEY to ~/.zshenv"}'
           all_pass=false
         fi ;;
       s3)
@@ -965,16 +1004,16 @@ EOF
         _dc '{"name":"backend_credentials","status":"pass","detail":"local backend (no credentials needed)"}' ;;
     esac
 
-    # 9. Repo reachable
+    # 8. Repo reachable
     bb::config::set_restic_env &>/dev/null || true
     if restic cat config &>/dev/null; then
       _dc '{"name":"repo","status":"pass","detail":"reachable"}'
     else
-      _dc '{"name":"repo","status":"fail","detail":"unreachable"}'
+      _dc '{"name":"repo","status":"fail","detail":"unreachable. Check credentials and backend config"}'
       all_pass=false
     fi
 
-    # 10. Profile paths
+    # 9. Profile paths
     local config_yaml
     config_yaml=$(bb::config::load 2>/dev/null) || config_yaml=""
     if [[ -n "$config_yaml" ]]; then
@@ -991,23 +1030,79 @@ EOF
         all_pass=false
       fi
     fi
+
+    # 10. Schedule + recent backup
+    local plist_path="$HOME/Library/LaunchAgents/com.brain-dump.plist"
+    local sched_ok=false
+    local sched_detail=""
+
+    if [[ -f "$plist_path" ]]; then
+      # Check launchd loaded
+      if launchctl list 2>/dev/null | grep -q "com.brain-dump"; then
+        sched_ok=true
+
+        # Check last backup freshness
+        local snap_json
+        snap_json=$(restic snapshots --tag "brain-dump" --json 2>/dev/null || echo "[]")
+        local snap_count
+        snap_count=$(echo "$snap_json" | jq 'length')
+        if [[ "$snap_count" -gt 0 ]]; then
+          local last_time
+          last_time=$(echo "$snap_json" | jq -r '.[-1].time')
+          local now_iso
+          now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          local age_seconds
+          age_seconds=$(jq -n --arg t "$last_time" --arg n "$now_iso" '(($n | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) - ($t | split(".")[0] | strptime("%Y-%m-%dT%H:%M:%S") | mktime)) | if . < 0 then 0 else . end' 2>/dev/null || echo "999999")
+          local max_age=$((4 * 3600))  # 4 hours
+          if [[ "$age_seconds" -lt "$max_age" ]]; then
+            local age_min=$((age_seconds / 60))
+            sched_detail="installed, last backup ${age_min} min ago"
+          else
+            local age_h=$((age_seconds / 3600))
+            sched_detail="installed, but last backup ${age_h}h ago (stale!)"
+            sched_ok=false
+          fi
+        else
+          sched_detail="installed, but no snapshots found"
+          sched_ok=false
+        fi
+      else
+        sched_detail="plist exists but not loaded in launchd"
+      fi
+    else
+      sched_detail="not installed. Run: brain-dump schedule install"
+    fi
+
+    if [[ "$sched_ok" == "true" ]]; then
+      _dc "{\"name\":\"schedule\",\"status\":\"pass\",\"detail\":\"${sched_detail}\"}"
+    else
+      _dc "{\"name\":\"schedule\",\"status\":\"fail\",\"detail\":\"${sched_detail}\"}"
+      all_pass=false
+    fi
+
+    # 11. Disk space check (bonus)
+    local disk_available
+    disk_available=$(df -k "$HOME" | tail -1 | awk '{print $4}')
+    local disk_gb=$((disk_available / 1024 / 1024))
+    if [[ "$disk_gb" -gt 5 ]]; then
+      _dc "{\"name\":\"disk_space\",\"status\":\"pass\",\"detail\":\"${disk_gb}GB available\"}"
+    else
+      _dc "{\"name\":\"disk_space\",\"status\":\"fail\",\"detail\":\"only ${disk_gb}GB available (need >5GB)\"}"
+      all_pass=false
+    fi
   fi
 
-  # 11. Schedule status
-  local plist_path="$HOME/Library/LaunchAgents/com.brain-dump.plist"
-  if [[ -f "$plist_path" ]]; then
-    local sched_int
-    sched_int=$(plutil -extract StartInterval raw "$plist_path" 2>/dev/null || echo "unknown")
-    _dc "{\"name\":\"schedule\",\"status\":\"pass\",\"detail\":\"installed, every ${sched_int}s\"}"
-  else
-    _dc '{"name":"schedule","status":"fail","detail":"not installed"}'
-  fi
-
-  # Build final JSON array from collected lines
+  # Build final JSON array
   local checks
   checks=$(printf '%b' "$check_lines" | tr -d '\000-\037' | jq -s '.')
+  local pass_count fail_count
+  pass_count=$(echo "$checks" | jq '[.[] | select(.status == "pass")] | length')
+  fail_count=$(echo "$checks" | jq '[.[] | select(.status == "fail")] | length')
+  local total_count
+  total_count=$(echo "$checks" | jq 'length')
+
   local results
-  results=$(jq -n --argjson checks "$checks" --argjson all_pass "$all_pass" '{checks: $checks, all_pass: $all_pass}')
+  results=$(jq -n --argjson checks "$checks" --argjson all_pass "$all_pass" --argjson pass_count "$pass_count" --argjson fail_count "$fail_count" --argjson total_count "$total_count" '{checks: $checks, all_pass: $all_pass, passed: $pass_count, failed: $fail_count, total: $total_count}')
 
   bb::output::doctor_results "$results"
 
@@ -1051,6 +1146,140 @@ EOF
   else
     bb::config::load
   fi
+}
+
+#######################################
+# COMMAND: telemetry
+#######################################
+cmd_telemetry() {
+  local max_entries=20 filter="" show_json="false" show_stats="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --last) max_entries="$2"; shift 2 ;;
+      --query) filter="$2"; shift 2 ;;
+      --stats) show_stats="true"; shift ;;
+      --json) show_json="true"; shift ;;
+      --help)
+        cat <<EOF
+Usage: brain-dump telemetry [--last N] [--query FILTER] [--stats] [--json]
+
+Show backup telemetry and analytics.
+
+Flags:
+  --last N        Show last N entries (default: 20, 0=all)
+  --query FILTER  jq filter expression (e.g. 'exit_code == 0')
+  --stats         Show summary statistics
+  --json          Raw JSON output
+EOF
+        return 0 ;;
+      *)
+        bb::output::error "Unknown flag: $1. See: brain-dump telemetry --help"
+        return 1 ;;
+    esac
+  done
+
+  # Stats mode
+  if [[ "$show_stats" == "true" ]]; then
+    local stats
+    stats=$(bb::telemetry::stats)
+    if [[ "$show_json" == "true" ]]; then
+      echo "$stats"
+    else
+      local total_snap total_err total_bytes avg_dur last_snap
+      total_snap=$(echo "$stats" | jq -r '.total_snapshots')
+      total_err=$(echo "$stats" | jq -r '.total_errors')
+      total_bytes=$(bb::output::human_bytes "$(echo "$stats" | jq -r '.total_bytes_added')")
+      avg_dur=$(echo "$stats" | jq -r '.avg_duration_seconds')
+      last_snap=$(echo "$stats" | jq -r '.last_snapshot')
+
+      echo "Telemetry Summary:"
+      echo "  Total snapshots: ${total_snap}"
+      echo "  Total errors: ${total_err}"
+      echo "  Total bytes added: ${total_bytes}"
+      echo "  Avg duration: ${avg_dur}s"
+      echo "  Last snapshot: ${last_snap}"
+    fi
+    return 0
+  fi
+
+  # Query mode
+  local entries
+  entries=$(bb::telemetry::query "$max_entries" "$filter")
+
+  if [[ "$show_json" == "true" ]]; then
+    echo "$entries" | jq -s '.'
+  else
+    local count
+    count=$(echo "$entries" | grep -c '.' 2>/dev/null || echo 0)
+    if [[ "$count" -eq 0 || "$entries" == "[]" ]]; then
+      echo "No telemetry entries found."
+      return 0
+    fi
+
+    echo "Last ${max_entries} telemetry entries:"
+    echo ""
+    echo "$entries" | jq -r '. | "\(.timestamp) | \(.snapshot_id[:8] // "unknown") | \(.duration_seconds)s | \(.files_new) new | +\(.bytes_added) bytes | \(if .exit_code == 0 then "✅" else "❌" end)"' 2>/dev/null
+  fi
+}
+
+#######################################
+# COMMAND: errors
+#######################################
+cmd_errors() {
+  local max_entries=10 clear_errors="false"
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --last) max_entries="$2"; shift 2 ;;
+      --clear) clear_errors="true"; shift ;;
+      --help)
+        cat <<EOF
+Usage: brain-dump errors [--last N] [--clear]
+
+Show quarantined errors.
+
+Flags:
+  --last N   Show last N errors (default: 10)
+  --clear    Clear all quarantined errors
+EOF
+        return 0 ;;
+      *)
+        bb::output::error "Unknown flag: $1. See: brain-dump errors --help"
+        return 1 ;;
+    esac
+  done
+
+  local err_dir
+  err_dir="${HOME}/.brain-dump/errors"
+
+  # Clear mode
+  if [[ "$clear_errors" == "true" ]]; then
+    if [[ -d "$err_dir" ]]; then
+      rm -f "$err_dir"/*.json 2>/dev/null
+      echo "✅ Cleared all quarantined errors."
+    else
+      echo "No errors directory found."
+    fi
+    return 0
+  fi
+
+  # List mode
+  if [[ ! -d "$err_dir" ]] || [[ -z "$(ls -A "$err_dir" 2>/dev/null)" ]]; then
+    echo "No quarantined errors found. ✅"
+    return 0
+  fi
+
+  echo "Quarantined errors (last ${max_entries}):"
+  echo ""
+  ls -t "$err_dir"/*.json 2>/dev/null | head -n "$max_entries" | while read -r f; do
+    local ts op msg code
+    ts=$(jq -r '.timestamp' "$f" 2>/dev/null || echo "unknown")
+    op=$(jq -r '.operation' "$f" 2>/dev/null || echo "unknown")
+    msg=$(jq -r '.error' "$f" 2>/dev/null || echo "unknown")
+    code=$(jq -r '.exit_code' "$f" 2>/dev/null || echo "1")
+    echo "  ❌ ${ts} | ${op} | exit ${code} | ${msg}"
+  done
 }
 
 #######################################
@@ -1109,6 +1338,8 @@ main() {
     prune)     cmd_prune "$@" ;;
     schedule)  cmd_schedule "$@" ;;
     doctor)    cmd_doctor "$@" ;;
+    telemetry) cmd_telemetry "$@" ;;
+    errors)    cmd_errors "$@" ;;
     config)    cmd_config "$@" ;;
     *)
       bb::output::error "Unknown command: $command. Run: brain-dump --help"
