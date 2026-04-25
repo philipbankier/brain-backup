@@ -167,6 +167,29 @@ bb::config::validate() {
     fi
   done
 
+  # Rule 11: error_handling.mode must be strict or lenient (if present)
+  local err_mode
+  err_mode=$(echo "$config" | yq eval '.error_handling.mode' -)
+  if [[ -n "$err_mode" && "$err_mode" != "null" ]]; then
+    if [[ "$err_mode" != "strict" && "$err_mode" != "lenient" ]]; then
+      bb::output::error "Config invalid: error_handling.mode must be 'strict' or 'lenient' (got: $err_mode)"
+      return 1
+    fi
+  fi
+
+  # Rule 12: resource_limits must be positive integers (if present)
+  local res_keys=("max_memory_mb" "max_duration_minutes" "max_files_per_profile")
+  for key in "${res_keys[@]}"; do
+    local rval
+    rval=$(echo "$config" | yq eval ".resource_limits.$key" -)
+    if [[ -n "$rval" && "$rval" != "null" ]]; then
+      if ! [[ "$rval" =~ ^[1-9][0-9]*$ ]]; then
+        bb::output::error "Config invalid: resource_limits.$key must be a positive integer (got: $rval)"
+        return 1
+      fi
+    fi
+  done
+
   return 0
 }
 

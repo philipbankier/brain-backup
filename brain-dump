@@ -55,7 +55,7 @@ Commands:
   doctor               Check dependencies, config, and health
   telemetry            Show backup telemetry and analytics
   errors               Show quarantined errors
-  config               Show resolved configuration
+  config               Show or validate configuration
 
 Global flags:
   --config FILE        Path to config file (default: ~/.config/brain-dump/config.yaml)
@@ -209,7 +209,8 @@ ${bucket_line}"
 ${path_line}"
   fi
 
-  local config_content="version: 1
+  local config_content="version: 2
+config_schema: \"2.0\"
 repository:
 ${repo_block}
 profiles:${profiles_yaml}
@@ -220,6 +221,14 @@ retention:
   daily: 30
   monthly: 12
   yearly: 0
+error_handling:
+  mode: \"strict\"
+  quarantine_errors: true
+  quarantine_dir: \"~/.brain-dump/errors\"
+resource_limits:
+  max_memory_mb: 512
+  max_duration_minutes: 30
+  max_files_per_profile: 100000
 "
 
   # Create config dir
@@ -322,6 +331,12 @@ EOF
   config=$(bb::config::load) || return 1
   bb::config::validate || return 1
   bb::config::set_restic_env || return 3
+
+  # Read v2 config sections
+  local error_mode max_duration max_files
+  error_mode=$(echo "$config" | yq eval '.error_handling.mode // "strict"' -)
+  max_duration=$(echo "$config" | yq eval '.resource_limits.max_duration_minutes // 30' -)
+  max_files=$(echo "$config" | yq eval '.resource_limits.max_files_per_profile // 100000' -)
 
   # Resolve profiles
   local all_paths all_excludes
@@ -456,6 +471,21 @@ EOF
   # Clean up old telemetry (30-day retention)
   bb::telemetry::cleanup 30
   bb::telemetry::cleanup_errors 30
+
+  # Resource limit warnings
+  local elapsed_min=$(( duration / 60 ))
+  if [[ "$elapsed_min" -gt "$max_duration" ]]; then
+    bb::output::print "⚠️  Snapshot took ${elapsed_min}m (limit: ${max_duration}m). Consider reducing profile sizes."
+  fi
+
+  local path_pfx
+  for path_pfx in "${paths_args[@]}"; do
+    local file_count
+    file_count=$(find "$path_pfx" -type f 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "$file_count" -gt "$max_files" ]]; then
+      bb::output::print "⚠️  ${path_pfx} has ${file_count} files (limit: ${max_files}). Consider excluding subdirectories."
+    fi
+  done
 }
 
 #######################################
@@ -1118,34 +1148,65 @@ EOF
 # COMMAND: config
 #######################################
 cmd_config() {
-  local path_key=""
+  local subcmd="${1:-}"
+  shift 2>/dev/null || true
 
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --path) path_key="$2"; shift 2 ;;
-      --help)
-        cat <<EOF
-Usage: brain-dump config [--path KEY]
+  case "$subcmd" in
+    validate)
+      bb::check_deps || return 2
+      bb::config::validate && echo "✅ Config is valid" || true
+      return $? ;;
+    ""|show)
+      local path_key=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --path) path_key="$2"; shift 2 ;;
+          --help)
+            cat <<EOF
+Usage: brain-dump config [show] [--path KEY]
+       brain-dump config validate
 
-Show resolved configuration.
+Show or validate configuration.
+
+Subcommands:
+  show (default)   Show resolved config
+  validate         Validate config schema
 
 Flags:
-  --path KEY   Extract a single config value (yq path, e.g. .repository.backend)
+  --path KEY       Extract a single config value (yq path)
 EOF
-        return 0 ;;
-      *)
-        bb::output::error "Unknown flag: $1. See: brain-dump config --help"
-        return 1 ;;
-    esac
-  done
+            return 0 ;;
+          *)
+            bb::output::error "Unknown flag: $1. See: brain-dump config --help"
+            return 1 ;;
+        esac
+      done
 
-  bb::check_deps || return 2
+      bb::check_deps || return 2
+      if [[ -n "$path_key" ]]; then
+        bb::config::get "$path_key"
+      else
+        bb::config::load
+      fi ;;
+    --help)
+      cat <<EOF
+Usage: brain-dump config [show] [--path KEY]
+       brain-dump config validate
 
-  if [[ -n "$path_key" ]]; then
-    bb::config::get "$path_key"
-  else
-    bb::config::load
-  fi
+Show or validate configuration.
+
+Subcommands:
+  show (default)   Show resolved config
+  validate         Validate config schema
+
+Flags:
+  --path KEY       Extract a single config value (yq path)
+EOF
+      return 0 ;;
+    *)
+      bb::output::error "Unknown subcommand: $subcmd. See: brain-dump config --help"
+      return 1 ;;
+  esac
 }
 
 #######################################
