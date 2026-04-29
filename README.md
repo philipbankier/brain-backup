@@ -224,7 +224,7 @@ brain-dump includes an [agentskills.io](https://agentskills.io) compliant skill
 at `skill/brain-dump/`. Install it in your agent's skill directory to let AI
 agents trigger backups and check status.
 
-Restore always requires user confirmation — agents never auto-overwrite.
+Restore always requires user confirmation — agents should never auto-overwrite.
 
 ## How It Works
 
