@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # brain-dump — Opinionated restic wrapper for AI agent memory backup
-# Version: 0.1.0
+# Version: 0.9.0
 set -euo pipefail
 
-readonly BB_VERSION="0.2.0"
+readonly BB_VERSION="0.9.0"
 
 # Detect script directory (dev mode vs installed mode)
 BB_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -30,7 +30,7 @@ BB_PRESET_DIR="${BB_PRESET_DIR}"
 BB_JSON_MODE="false"
 BB_QUIET_MODE="false"
 BB_VERBOSE_MODE="false"
-BB_CONFIG_FILE="$HOME/.config/brain-dump/config.yaml"
+BB_CONFIG_FILE="${BB_CONFIG_FILE:-$HOME/.config/brain-dump/config.yaml}"
 
 # Export for libs
 export BB_JSON_MODE BB_QUIET_MODE BB_VERBOSE_MODE BB_CONFIG_FILE
@@ -299,6 +299,21 @@ resource_limits:
 #######################################
 # COMMAND: snapshot
 #######################################
+bb::snapshot::parse_forget_counts() {
+  local forget_output="$1"
+  local key="$2"
+
+  echo "$forget_output" | jq -r --arg key "$key" '
+    if type == "object" then
+      (.[$key] // [] | length)
+    elif type == "array" then
+      ([.[] | .[$key]? // empty] | flatten | length)
+    else
+      0
+    end
+  ' 2>/dev/null | tr -d '\n' | grep -oE '^[0-9]+' || echo "0"
+}
+
 cmd_snapshot() {
   local profile_filter="" dry_run="false"
 
@@ -398,10 +413,160 @@ EOF
   # Dry run
   if [[ "$dry_run" == "true" ]]; then
     local cmd_str="restic backup ${paths_args[*]}"
-    for e in "${exclude_args[@]}"; do cmd_str="$cmd_str $e"; done
+    if [[ ${#exclude_args[@]} -gt 0 ]]; then
+      for e in "${exclude_args[@]}"; do cmd_str="$cmd_str $e"; done
+    fi
     for t in "${tag_args[@]}"; do cmd_str="$cmd_str $t"; done
     cmd_str="$cmd_str --json"
     bb::output::print "Would run: $cmd_str"
+    return 0
+  fi
+
+  if [[ "$error_mode" == "lenient" ]]; then
+    local start_time end_time duration
+    start_time=$(date +%s)
+
+    local agg_files_new=0 agg_files_changed=0 agg_files_unmod=0 agg_bytes_added=0 agg_bytes_stored=0
+    local success_count=0 failure_count=0 snapshot_ids="" successful_profiles=""
+
+    local profile_count
+    profile_count=$(echo "$config" | yq eval '.profiles | length' -)
+    local pi=0
+    while [[ $pi -lt $profile_count ]]; do
+      local profile_name
+      profile_name=$(echo "$config" | yq eval ".profiles[$pi].name" -)
+      if [[ -n "$profile_filter" && "$profile_name" != "$profile_filter" ]]; then
+        pi=$((pi + 1))
+        continue
+      fi
+
+      local p_paths p_excludes p_existing p_path_count
+      {
+        read -r p_paths
+        read -r p_excludes
+      } < <(bb::presets::resolve "$config" "$pi")
+      p_existing=$(bb::presets::filter_existing "$p_paths")
+      p_path_count=$(echo "$p_existing" | jq 'length')
+      if [[ "$p_path_count" -eq 0 ]]; then
+        bb::telemetry::record_error "snapshot" "No backup paths exist for profile ${profile_name}" 5
+        failure_count=$((failure_count + 1))
+        pi=$((pi + 1))
+        continue
+      fi
+
+      local p_path_args=()
+      while IFS= read -r p; do
+        p_path_args+=("$p")
+      done < <(echo "$p_existing" | jq -r '.[]')
+
+      local p_exclude_args=()
+      while IFS= read -r e; do
+        p_exclude_args+=("--exclude" "$e")
+      done < <(echo "$p_excludes" | jq -r '.[]')
+
+      local p_tag_args=("--tag" "brain-dump" "--tag" "$profile_name")
+      local p_backup_cmd=(restic backup "${p_path_args[@]}")
+      if [[ ${#p_exclude_args[@]} -gt 0 ]]; then
+        p_backup_cmd+=("${p_exclude_args[@]}")
+      fi
+      p_backup_cmd+=("${p_tag_args[@]}" --json)
+      local p_output p_summary
+      if p_output=$("${p_backup_cmd[@]}" 2>&1); then
+        p_summary=$(echo "$p_output" | grep '"message_type":"summary"' | tail -1 || true)
+        [[ -z "$p_summary" ]] && p_summary=$(echo "$p_output" | tail -1)
+        if echo "$p_summary" | jq '.' >/dev/null 2>&1; then
+          success_count=$((success_count + 1))
+          agg_files_new=$((agg_files_new + $(echo "$p_summary" | jq -r '.files_new // 0')))
+          agg_files_changed=$((agg_files_changed + $(echo "$p_summary" | jq -r '.files_changed // 0')))
+          agg_files_unmod=$((agg_files_unmod + $(echo "$p_summary" | jq -r '.files_unmodified // 0')))
+          agg_bytes_added=$((agg_bytes_added + $(echo "$p_summary" | jq -r '.data_added // 0')))
+          agg_bytes_stored=$((agg_bytes_stored + $(echo "$p_summary" | jq -r '.total_bytes_processed // 0')))
+          local sid
+          sid=$(echo "$p_summary" | jq -r '.snapshot_id // "unknown"')
+          snapshot_ids="${snapshot_ids}${snapshot_ids:+,}${sid}"
+          successful_profiles="${successful_profiles}${successful_profiles:+,}${profile_name}"
+        else
+          failure_count=$((failure_count + 1))
+          bb::telemetry::record_error "snapshot" "Unexpected restic output for profile ${profile_name}" 4
+        fi
+      else
+        local rc=$?
+        failure_count=$((failure_count + 1))
+        bb::output::verbose "restic output for ${profile_name}: $p_output"
+        bb::telemetry::record_error "snapshot" "Restic backup failed for profile ${profile_name} (exit ${rc})" "$rc"
+      fi
+
+      pi=$((pi + 1))
+    done
+
+    end_time=$(date +%s)
+    duration=$((end_time - start_time))
+
+    if [[ "$success_count" -eq 0 ]]; then
+      bb::telemetry::record_snapshot "unknown" "$duration" 0 0 0 0 0 4 "$profile_names" 0
+      bb::output::error "All profile backups failed in lenient mode. See: brain-dump errors"
+      return 4
+    fi
+
+    local retention_flags forget_output pruned=0 kept=0
+    retention_flags=$(bb::config::retention_flags) || true
+    if [[ -n "$retention_flags" ]]; then
+      forget_output=$(restic forget $retention_flags --prune --tag "brain-dump" --json 2>&1) || {
+        bb::output::verbose "forget output: $forget_output"
+        bb::telemetry::record_error "prune" "Post-snapshot prune failed" 4
+      }
+      if [[ -n "${forget_output:-}" ]]; then
+        pruned=$(bb::snapshot::parse_forget_counts "$forget_output" "remove")
+        kept=$(bb::snapshot::parse_forget_counts "$forget_output" "keep")
+      fi
+    fi
+
+    local summary_json
+    summary_json=$(jq -n \
+      --arg sid "multiple" \
+      --arg snapshots "$snapshot_ids" \
+      --argjson files_new "$agg_files_new" \
+      --argjson files_changed "$agg_files_changed" \
+      --argjson files_unmod "$agg_files_unmod" \
+      --argjson bytes_added "$agg_bytes_added" \
+      --argjson bytes_stored "$agg_bytes_stored" \
+      --argjson duration "$duration" \
+      --argjson successes "$success_count" \
+      --argjson failures "$failure_count" \
+      '{
+        message_type: "summary",
+        snapshot_id: $sid,
+        snapshot_ids: ($snapshots | split(",") | map(select(length > 0))),
+        files_new: $files_new,
+        files_changed: $files_changed,
+        files_unmodified: $files_unmod,
+        data_added: $bytes_added,
+        total_bytes_processed: $bytes_stored,
+        total_duration: $duration,
+        profiles_succeeded: $successes,
+        profiles_failed: $failures
+      }')
+
+    bb::output::snapshot_summary "$summary_json" "$pruned" "$kept" "$successful_profiles"
+    if [[ "$failure_count" -gt 0 ]]; then
+      bb::output::print "⚠️  ${failure_count} profile(s) failed in lenient mode. See: brain-dump errors"
+    fi
+    bb::telemetry::record_snapshot "multiple" "$duration" "$agg_files_new" "$agg_files_changed" "$agg_files_unmod" "$agg_bytes_added" "$agg_bytes_stored" 0 "$successful_profiles" "$pruned"
+    bb::telemetry::cleanup 30
+    bb::telemetry::cleanup_errors 30
+
+    local elapsed_min=$(( duration / 60 ))
+    if [[ "$elapsed_min" -gt "$max_duration" ]]; then
+      bb::output::print "⚠️  Snapshot took ${elapsed_min}m (limit: ${max_duration}m). Consider reducing profile sizes."
+    fi
+    local path_pfx
+    for path_pfx in "${paths_args[@]}"; do
+      local file_count
+      file_count=$(find "$path_pfx" -type f 2>/dev/null | wc -l | tr -d ' ')
+      if [[ "$file_count" -gt "$max_files" ]]; then
+        bb::output::print "⚠️  ${path_pfx} has ${file_count} files (limit: ${max_files}). Consider excluding subdirectories."
+      fi
+    done
     return 0
   fi
 
@@ -409,7 +574,12 @@ EOF
   local start_time
   start_time=$(date +%s)
   local restic_output
-  restic_output=$(restic backup "${paths_args[@]}" "${exclude_args[@]}" "${tag_args[@]}" --json 2>/dev/null) || {
+  local backup_cmd=(restic backup "${paths_args[@]}")
+  if [[ ${#exclude_args[@]} -gt 0 ]]; then
+    backup_cmd+=("${exclude_args[@]}")
+  fi
+  backup_cmd+=("${tag_args[@]}" --json)
+  restic_output=$("${backup_cmd[@]}" 2>&1) || {
     local rc=$?
     local end_time
     end_time=$(date +%s)
@@ -444,12 +614,8 @@ EOF
       bb::output::verbose "forget stderr: $forget_output"
     }
     if [[ -n "$forget_output" ]]; then
-      pruned=$(echo "$forget_output" | jq -r '. | if type == "array" then (.[] | select(.tags) | .tags) else . end' 2>/dev/null | wc -l | tr -d ' ')
-      # Try to get removed/kept from forget JSON
-      local removed_count
-      removed_count=$(echo "$forget_output" | jq -r '[.[].tags // empty] | length' 2>/dev/null || echo "0")
-      pruned=$(echo "$forget_output" | jq -r 'if type == "object" then (.remove | length) else 0 end' 2>/dev/null || echo "0")
-      kept=$(echo "$forget_output" | jq -r 'if type == "object" then (.keep | length) else 0 end' 2>/dev/null || echo "0")
+      pruned=$(bb::snapshot::parse_forget_counts "$forget_output" "remove")
+      kept=$(bb::snapshot::parse_forget_counts "$forget_output" "keep")
     fi
   fi
 
@@ -544,6 +710,11 @@ EOF
   local dry_flag=""
   if [[ "$dry_run" == "true" ]]; then
     dry_flag="--dry-run"
+  fi
+
+  if [[ -e "$target" ]] && [[ -n "$(ls -A "$target" 2>/dev/null)" ]]; then
+    bb::output::error "Restore target exists and is not empty: ${target}. Choose a new empty directory."
+    return 1
   fi
 
   if restic restore "$snapshot_id" --target "$target" $dry_flag 2>&1; then
@@ -663,9 +834,23 @@ EOF
       # Get the LAST snapshot (most recent) — restic returns oldest-first
       last_id=$(echo "$snap_json" | jq -r '.[-1].id[:8]')
       last_time=$(echo "$snap_json" | jq -r '.[-1].time')
-      local now_iso
-      now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
-      age_seconds=$(jq -n --arg t "$last_time" --arg n "$now_iso" '(($n | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) - ($t | split(".")[0] | strptime("%Y-%m-%dT%H:%M:%S") | mktime)) | if . < 0 then 0 else . end' 2>/dev/null || echo "0")
+      now_iso=$(date +%s)
+      local snap_epoch
+      # restic returns ISO with timezone offset (e.g. 2026-04-30T12:08:27.401503-04:00)
+      # jq's mktime ignores %z, so we use python or perl for correct epoch conversion
+      snap_epoch=$(python3 -c "
+import datetime,sys
+try:
+    t=sys.stdin.read().strip()
+    # Strip microseconds, keep offset
+    import re
+    t=re.sub(r'\.\d+', '', t)
+    dt=datetime.datetime.fromisoformat(t)
+    print(int(dt.timestamp()))
+except: print(0)
+" <<< "$last_time" 2>/dev/null || echo "0")
+      age_seconds=$(( now_iso - snap_epoch ))
+      [[ $age_seconds -lt 0 ]] && age_seconds=0
       age_human=$(bb::output::human_age "$age_seconds" 2>/dev/null || echo "N/A")
     fi
   fi
@@ -776,9 +961,7 @@ EOF
   }
 
   local removed
-  removed=$(echo "$output" | jq -r 'if type == "object" then (.remove | length) else 0 end' 2>/dev/null | tr -d '\n' | head -1 || echo "0")
-  # Ensure removed is a clean integer
-  removed=$(echo "$removed" | grep -oE '^[0-9]+' || echo "0")
+  removed=$(bb::snapshot::parse_forget_counts "$output" "remove")
 
   if [[ "$removed" -eq 0 ]]; then
     bb::output::print "Nothing to prune."
@@ -877,11 +1060,13 @@ cmd_schedule_install() {
   # Load with launchctl
   local uid
   uid=$(id -u)
-  launchctl bootstrap "gui/${uid}" "$plist_path" 2>&1 || {
+  if ! launchctl bootstrap "gui/${uid}" "$plist_path" 2>&1; then
     # Already loaded? Try bootout + bootstrap
     launchctl bootout "gui/${uid}/com.brain-dump" 2>/dev/null || true
-    launchctl bootstrap "gui/${uid}" "$plist_path" 2>&1
-  }
+    if ! launchctl bootstrap "gui/${uid}" "$plist_path" 2>&1; then
+      bb::output::print "⚠️  Schedule plist installed, but launchctl could not load it in this session."
+    fi
+  fi
 
   local interval_h=$((interval / 3600))
   bb::output::print "✅ Scheduled every ${interval_h} hour(s). Next run at login or after interval."
@@ -935,7 +1120,7 @@ cmd_doctor() {
         cat <<EOF
 Usage: brain-dump doctor [--json]
 
-Run 10-point health check:
+Run 11-point health check:
   1. bash version
   2. restic installed
   3. yq installed
@@ -946,6 +1131,7 @@ Run 10-point health check:
   8. repository reachable
   9. profile paths exist
   10. schedule installed + recent backup
+  11. disk space
 EOF
         return 0 ;;
       *)
@@ -1080,9 +1266,18 @@ EOF
           local last_time
           last_time=$(echo "$snap_json" | jq -r '.[-1].time')
           local now_iso
-          now_iso=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          now_iso=$(date +%s)
           local age_seconds
-          age_seconds=$(jq -n --arg t "$last_time" --arg n "$now_iso" '(($n | strptime("%Y-%m-%dT%H:%M:%SZ") | mktime) - ($t | split(".")[0] | strptime("%Y-%m-%dT%H:%M:%S") | mktime)) | if . < 0 then 0 else . end' 2>/dev/null || echo "999999")
+          local snap_epoch
+          snap_epoch=$(python3 -c "
+import datetime,sys,re
+try:
+    t=re.sub(r'\.\d+', '', sys.stdin.read().strip())
+    print(int(datetime.datetime.fromisoformat(t).timestamp()))
+except: print(0)
+" <<< "$last_time" 2>/dev/null || echo "0")
+          age_seconds=$(( now_iso - snap_epoch ))
+          [[ $age_seconds -lt 0 ]] && age_seconds=0
           local max_age=$((4 * 3600))  # 4 hours
           if [[ "$age_seconds" -lt "$max_age" ]]; then
             local age_min=$((age_seconds / 60))
@@ -1148,14 +1343,20 @@ EOF
 # COMMAND: config
 #######################################
 cmd_config() {
-  local subcmd="${1:-}"
-  shift 2>/dev/null || true
+  local subcmd="show"
+  if [[ $# -gt 0 && "$1" != --* ]]; then
+    subcmd="$1"
+    shift
+  fi
 
   case "$subcmd" in
     validate)
       bb::check_deps || return 2
-      bb::config::validate && echo "✅ Config is valid" || true
-      return $? ;;
+      if bb::config::validate; then
+        echo "✅ Config is valid"
+        return 0
+      fi
+      return 1 ;;
     ""|show)
       local path_key=""
       while [[ $# -gt 0 ]]; do
@@ -1269,11 +1470,15 @@ EOF
   entries=$(bb::telemetry::query "$max_entries" "$filter")
 
   if [[ "$show_json" == "true" ]]; then
-    echo "$entries" | jq -s '.'
+    if [[ -n "$entries" ]]; then
+      echo "$entries" | jq -s '.'
+    else
+      echo "[]"
+    fi
   else
     local count
     count=$(echo "$entries" | grep -c '.' 2>/dev/null || echo 0)
-    if [[ "$count" -eq 0 || "$entries" == "[]" ]]; then
+    if [[ "$count" -eq 0 ]]; then
       echo "No telemetry entries found."
       return 0
     fi

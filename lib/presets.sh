@@ -145,7 +145,7 @@ bb::presets::resolve() {
   fi
 
   # Expand ~ in paths to $HOME
-  paths_json=$(echo "$paths_json" | jq -r --arg home "$HOME" '.[] | sub("~"; $home)' | jq -R . | jq -sc .)
+  paths_json=$(echo "$paths_json" | jq -r --arg home "$HOME" '.[] | sub("^~"; $home)' | jq -R . | jq -sc .)
 
   # Compact JSON for reliable line-by-line reading
   paths_json=$(echo "$paths_json" | jq -c '. // []' 2>/dev/null || echo '[]')

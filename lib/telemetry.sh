@@ -135,7 +135,6 @@ bb::telemetry::query() {
   local filter="${2:-.}"
 
   if [[ ! -f "$BB_TELEMETRY_FILE" ]]; then
-    echo "[]"
     return 0
   fi
 
@@ -150,11 +149,7 @@ bb::telemetry::query() {
     result=$(echo "$result" | tail -n "$max_entries")
   fi
 
-  if [[ -n "$result" ]]; then
-    echo "$result"
-  else
-    echo "[]"
-  fi
+  [[ -n "$result" ]] && echo "$result"
 }
 
 #######################################
@@ -213,8 +208,8 @@ bb::telemetry::stats() {
   cat "$BB_TELEMETRY_FILE" | jq -s '{
     total_snapshots: [.[].type | select(. == "snapshot")] | length,
     total_errors: [.[].exit_code | select(. != 0)] | length,
-    total_bytes_added: [.[].bytes_added // 0] | add,
-    avg_duration_seconds: ([.[].duration_seconds // 0] | add / length * 100 | floor / 100),
+    total_bytes_added: ([.[].bytes_added // 0] | add // 0),
+    avg_duration_seconds: (if length == 0 then 0 else ([.[].duration_seconds // 0] | add / length * 100 | floor / 100) end),
     last_snapshot: (map(select(.type == "snapshot")) | last | .timestamp // "never"),
     last_error: (map(select(.exit_code != 0)) | last | .timestamp // "never")
   }'

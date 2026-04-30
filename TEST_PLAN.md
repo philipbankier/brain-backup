@@ -172,10 +172,10 @@ test_config_load() {
   # Valid config
   local config_path="$FIXTURES/config-valid.yaml"
   cat > "$config_path" << YAML
-version: 1
+version: 2
 repository:
   backend: local
-  bucket: "$TEMP_REPO"
+  path: "$TEMP_REPO"
 profiles:
   - name: test
     paths:
@@ -186,7 +186,7 @@ YAML
   local loaded
   loaded=$(BB_CONFIG_FILE="$config_path" bb::config::load)
 
-  assert_contains "$loaded" "version: 1" "loads version"
+  assert_contains "$loaded" "version: 2" "loads version"
   assert_contains "$loaded" "backend: local" "loads backend"
 }
 ```
@@ -201,7 +201,7 @@ test_config_validate() {
   cat > "$config_path" << YAML
 repository:
   backend: local
-  bucket: test
+  path: test
 profiles: []
 YAML
 
@@ -220,10 +220,10 @@ test_presets_resolve() {
   # Test preset merge: profile paths override, excludes merge
   local config_path="$FIXTURES/config-test-merge.yaml"
   cat > "$config_path" << YAML
-version: 1
+version: 2
 repository:
   backend: local
-  bucket: test
+  path: test
 profiles:
   - name: test-profile
     preset: openclaw
@@ -293,7 +293,7 @@ test_init_creates_config() {
 
   local content
   content=$(cat "$config_file")
-  assert_contains "$content" "version: 1" "config has version"
+  assert_contains "$content" "version: 2" "config has version"
   assert_contains "$content" "backend: local" "config has backend"
 }
 ```
@@ -510,10 +510,10 @@ test_duplicate_profiles() {
 
   local config_path="$FIXTURES/config-duplicate-profiles.yaml"
   cat > "$config_path" << YAML
-version: 1
+version: 2
 repository:
   backend: local
-  bucket: test
+  path: test
 profiles:
   - name: test
     paths: ["/tmp"]
@@ -534,10 +534,10 @@ test_nonexistent_paths_skipped() {
 
   local config_path="$FIXTURES/config-nonexistent-paths.yaml"
   cat > "$config_path" << YAML
-version: 1
+version: 2
 repository:
   backend: local
-  bucket: "$TEMP_REPO"
+  path: "$TEMP_REPO"
 profiles:
   - name: test
     paths:
@@ -564,7 +564,7 @@ test_crlf_config() {
   echo "Testing: CRLF line endings handled"
 
   local config_path="$FIXTURES/config-crlf.yaml"
-  printf 'version: 1\r\nrepository:\r\n  backend: local\r\n  bucket: test\r\nprofiles: []\r\n' > "$config_path"
+  printf 'version: 2\r\nrepository:\r\n  backend: local\r\n  bucket: test\r\nprofiles: []\r\n' > "$config_path"
 
   export BB_CONFIG_FILE="$config_path"
 

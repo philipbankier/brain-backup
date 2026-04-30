@@ -144,6 +144,12 @@ bb::config::validate() {
     local preset paths_len
     preset=$(echo "$config" | yq eval ".profiles[$i].preset" -)
     paths_len=$(echo "$config" | yq eval ".profiles[$i].paths | length" -)
+    if [[ -n "$preset" && "$preset" != "null" ]]; then
+      if declare -F bb::presets::exists >/dev/null && ! bb::presets::exists "$preset"; then
+        bb::output::error "Unknown preset: '${preset}' in profile '$name'"
+        return 1
+      fi
+    fi
     if [[ -z "$preset" || "$preset" == "null" ]]; then
       if [[ "$paths_len" == "0" || "$paths_len" == "null" ]]; then
         bb::output::error "Profile '$name' has no paths and no preset. Add at least one."
@@ -228,8 +234,8 @@ bb::config::repo_url() {
     local)
       local repo_path
       repo_path=$(echo "$config" | yq eval '.repository.path' -)
-      # Expand ~ and env vars
-      eval echo "$repo_path"
+      # Expand only a leading ~; do not eval config content as shell code.
+      echo "${repo_path/#\~/$HOME}"
       ;;
     *)
       bb::output::error "Unknown backend: $backend"

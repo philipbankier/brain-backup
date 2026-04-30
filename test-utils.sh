@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # test-utils.sh — Shared test helpers for brain-dump
-set -euo pipefail
+set -uo pipefail
+set +e
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -9,6 +10,8 @@ TEST_DIR="/tmp/brain-dump-tests"
 FIXTURES="$TEST_DIR/fixtures"
 TEMP_REPO="$TEST_DIR/test-repo"
 TEST_DATA="$FIXTURES/test-data"
+ORIGINAL_HOME="${HOME}"
+TEST_HOME="$TEST_DIR/home"
 
 # Test credential (for testing only)
 TEST_PASSWORD="test-password-123"
@@ -91,7 +94,8 @@ assert_json_field() {
 setup_test_env() {
   echo "Setting up test environment..."
   rm -rf "$TEST_DIR"
-  mkdir -p "$FIXTURES" "$TEST_DATA" "$TEMP_REPO"
+  mkdir -p "$FIXTURES" "$TEST_DATA" "$TEMP_REPO" "$TEST_HOME"
+  export HOME="$TEST_HOME"
 
   # Create test data
   echo "test content" > "$TEST_DATA/file1.txt"
@@ -101,10 +105,37 @@ setup_test_env() {
 
   # Create valid config fixture
   cat > "$FIXTURES/config-valid.yaml" << YAML
+version: 2
+config_schema: "2.0"
+repository:
+  backend: local
+  path: "$TEMP_REPO"
+profiles:
+  - name: test
+    paths:
+      - "$TEST_DATA"
+schedule:
+  interval: 3600
+retention:
+  hourly: 24
+  daily: 30
+  monthly: 12
+  yearly: 0
+error_handling:
+  mode: "strict"
+  quarantine_errors: true
+  quarantine_dir: "$TEST_DIR/errors"
+resource_limits:
+  max_memory_mb: 512
+  max_duration_minutes: 30
+  max_files_per_profile: 100000
+YAML
+
+  cat > "$FIXTURES/config-valid-v1.yaml" << YAML
 version: 1
 repository:
   backend: local
-  bucket: "$TEMP_REPO"
+  path: "$TEMP_REPO"
 profiles:
   - name: test
     paths:
@@ -121,27 +152,35 @@ YAML
   cat > "$FIXTURES/config-missing-version.yaml" << YAML
 repository:
   backend: local
-  bucket: test
+  path: "$TEMP_REPO"
 profiles: []
 YAML
 
   cat > "$FIXTURES/config-duplicate-profiles.yaml" << YAML
-version: 1
+version: 2
+config_schema: "2.0"
 repository:
   backend: local
-  bucket: test
+  path: "$TEMP_REPO"
 profiles:
   - name: test
     paths: ["/tmp"]
   - name: test
     paths: ["/var"]
+error_handling:
+  mode: "strict"
+resource_limits:
+  max_memory_mb: 512
+  max_duration_minutes: 30
+  max_files_per_profile: 100000
 YAML
 
   cat > "$FIXTURES/config-nonexistent-paths.yaml" << YAML
-version: 1
+version: 2
+config_schema: "2.0"
 repository:
   backend: local
-  bucket: "$TEMP_REPO"
+  path: "$TEMP_REPO"
 profiles:
   - name: test
     paths:
@@ -153,11 +192,19 @@ retention:
   hourly: 24
   daily: 30
   monthly: 12
+error_handling:
+  mode: "strict"
+resource_limits:
+  max_memory_mb: 512
+  max_duration_minutes: 30
+  max_files_per_profile: 100000
 YAML
 
   # Initialize restic repo
   export RESTIC_REPOSITORY="$TEMP_REPO"
   restic init 2>/dev/null || true
+  # Clear any stale locks from previous test runs
+  restic unlock 2>/dev/null || true
 
   echo "✓ Test environment ready"
   echo ""
@@ -170,6 +217,7 @@ teardown_test_env() {
     echo ""
     echo "Test artifacts kept at: $TEST_DIR"
   fi
+  export HOME="$ORIGINAL_HOME"
 }
 
 # Print summary
