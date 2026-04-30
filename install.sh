@@ -59,6 +59,7 @@ check_dep "jq"    "1.6+"  "jq --version"
 mkdir -p "$INSTALL_BIN"
 mkdir -p "$INSTALL_SHARE/lib"
 mkdir -p "$INSTALL_SHARE/presets"
+mkdir -p "$INSTALL_SHARE/launchd"
 
 # ── Helper: download with fallback ──────────────────────
 download() {
@@ -80,12 +81,17 @@ info "Downloading lib/..."
 download "lib/config.sh"   "$INSTALL_SHARE/lib/config.sh"
 download "lib/presets.sh"  "$INSTALL_SHARE/lib/presets.sh"
 download "lib/output.sh"   "$INSTALL_SHARE/lib/output.sh"
+download "lib/telemetry.sh" "$INSTALL_SHARE/lib/telemetry.sh"
 
 # ── 9. Download presets/ ───────────────────────────────
 info "Downloading presets/..."
 for preset in openclaw hermes claude-code codex windsurf; do
   download "presets/${preset}.yaml" "$INSTALL_SHARE/presets/${preset}.yaml"
 done
+
+# ── 10. Download launchd template ───────────────────────
+info "Downloading launchd template..."
+download "launchd/com.brain-dump.plist.template" "$INSTALL_SHARE/launchd/com.brain-dump.plist.template"
 
 # ── 11. PATH setup ─────────────────────────────────────
 if [[ ":$PATH:" != *":$INSTALL_BIN:"* ]]; then

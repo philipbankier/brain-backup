@@ -1,5 +1,7 @@
 # 🧠 brain-dump
 
+![Version](https://img.shields.io/badge/version-1.0.0-blue)
+
 Opinionated, encrypted backup for AI agent memory.
 
 Wraps [restic](https://restic.net/) with sane defaults for backing up AI agent
@@ -115,7 +117,9 @@ brain-dump schedule status       # Show schedule state
 ```
 
 ### `brain-dump doctor`
-Check all dependencies, config, credentials, repo, paths, and schedule.
+Run the full 11-point health check: bash, restic, yq, jq, config,
+encryption password, backend credentials, repository reachability, profile
+paths, schedule freshness, and disk space.
 
 ```bash
 brain-dump doctor                # Human-readable
@@ -123,11 +127,32 @@ brain-dump doctor --json         # Machine-readable
 ```
 
 ### `brain-dump config`
-Show resolved configuration.
+Show or validate resolved configuration.
 
 ```bash
 brain-dump config                          # Full config
 brain-dump config --path repository.backend  # Single value
+brain-dump config validate                 # Validate schema and limits
+```
+
+### `brain-dump telemetry`
+Show snapshot telemetry from `~/.brain-dump/telemetry.jsonl`.
+
+```bash
+brain-dump telemetry                       # Last 20 entries
+brain-dump telemetry --last 5              # Last 5 entries
+brain-dump telemetry --query 'exit_code == 0'
+brain-dump telemetry --stats               # Summary statistics
+brain-dump telemetry --stats --json        # Machine-readable stats
+```
+
+### `brain-dump errors`
+Show quarantined snapshot/prune errors.
+
+```bash
+brain-dump errors                          # Last 10 errors
+brain-dump errors --last 25                # Last 25 errors
+brain-dump errors --clear                  # Clear local quarantine files
 ```
 
 ## Supported Agent Presets
@@ -145,11 +170,13 @@ brain-dump config --path repository.backend  # Single value
 Config file: `~/.config/brain-dump/config.yaml`
 
 ```yaml
-version: 1
+version: 2
+config_schema: "2.0"
 repository:
   backend: b2           # b2, s3, or local
   bucket: my-backup     # B2 bucket name or S3 bucket
   # endpoint: ""        # Optional: custom S3 endpoint
+  # path: /absolute/repo # Required for local backend instead of bucket
 
 profiles:
   - name: my-agents
@@ -175,7 +202,21 @@ retention:
   hourly: 24            # Keep 24 hourly snapshots
   daily: 30             # Keep 30 daily snapshots
   monthly: 12           # Keep 12 monthly snapshots
+  yearly: 0
+
+error_handling:
+  mode: "strict"        # strict or lenient
+  quarantine_errors: true
+  quarantine_dir: "~/.brain-dump/errors"
+
+resource_limits:
+  max_memory_mb: 512
+  max_duration_minutes: 30
+  max_files_per_profile: 100000
 ```
+
+`version: 1` configs remain accepted for compatibility. New installs generate
+the version 2 schema shown above.
 
 ### Merge Rules
 
@@ -236,6 +277,8 @@ brain-dump is a thin bash wrapper around restic:
    overwrites existing files)
 3. **`schedule`**: Generates a macOS launchd plist and loads it via `launchctl`
 4. Everything else is config/validation/formatting
+5. **`telemetry`**: Reads structured JSONL backup history and summary stats
+6. **`errors`**: Lists or clears local quarantined error records
 
 No daemons, no background processes, no network services. Just bash + restic.
 

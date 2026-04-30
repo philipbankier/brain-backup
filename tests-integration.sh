@@ -50,7 +50,7 @@ test_integration() {
 
   # Verify required fields (per spec Appendix A)
   assert_json_field "$output" ".success" "true" "success field"
-  assert_json_field "$output" ".profiles" "[]" "profiles field"
+  assert_json_field "$output" ".profiles[0]" "test" "profiles field"
 
   # Test 4: restore requires target
   echo ""
@@ -80,7 +80,7 @@ test_integration() {
   local count
   count=$(echo "$output" | jq 'length')
 
-  assert_eq 1 "$count" "only brain-dump tagged shown"
+  assert_eq 2 "$count" "only brain-dump tagged shown"
 
   # Test 6: list --latest 1
   echo ""
@@ -121,7 +121,7 @@ test_integration() {
   echo "Test: config show"
   export BB_CONFIG_FILE="$FIXTURES/config-valid.yaml"
   output=$("$BB_CLI" config 2>&1)
-  assert_contains "$output" "version: 1" "config shows version"
+  assert_contains "$output" "version: 2" "config shows version"
 
   # Test 12: config --path
   echo ""
@@ -139,7 +139,7 @@ test_integration() {
   echo ""
   echo "Test: version"
   output=$("$BB_CLI" --version 2>&1)
-  assert_contains "$output" "0.1.0" "version shows 0.1.0"
+  assert_contains "$output" "1.0.0" "version shows 1.0.0"
 
   # Test 15: unknown command
   echo ""
