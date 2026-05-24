@@ -224,6 +224,46 @@ YAML
   export BB_CONFIG_FILE="$warn_config"
   output=$("$BB_CLI" snapshot 2>&1)
   assert_contains "$output" "limit: 1" "file-count warning shown"
+
+  # Regression 15: forget JSON mixed with prune progress does not break snapshot --json
+  echo ""
+  echo "Test: forget JSON with prune progress (regression)"
+  local fake_bin="$TEST_DIR/fake-bin"
+  mkdir -p "$fake_bin"
+  cat > "$fake_bin/restic" << 'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+cmd="${1:-}"
+shift || true
+case "$cmd" in
+  backup)
+    cat << 'JSON'
+{"message_type":"summary","files_new":1,"files_changed":0,"files_unmodified":0,"data_added":10,"total_bytes_processed":20,"total_duration":1.25,"snapshot_id":"abc123"}
+JSON
+    ;;
+  forget)
+    cat << 'OUT'
+[{"keep":[{"id":"keep-1"},{"id":"keep-2"}],"remove":[{"id":"remove-1"}]}]
+loading indexes...
+repacking packs
+done
+OUT
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+SH
+  chmod +x "$fake_bin/restic"
+  local old_path="$PATH"
+  PATH="$fake_bin:$PATH"
+  export BB_CONFIG_FILE="$FIXTURES/config-valid.yaml"
+  output=$("$BB_CLI" snapshot --json 2>&1)
+  local mixed_rc=$?
+  PATH="$old_path"
+  assert_eq 0 $mixed_rc "snapshot --json succeeds with mixed forget output"
+  echo "$output" | jq '.pruned.removed == 1 and .pruned.kept == 2' >/dev/null
+  assert_eq 0 $? "mixed forget counts stay numeric"
 }
 
 test_regressions

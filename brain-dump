@@ -303,15 +303,25 @@ bb::snapshot::parse_forget_counts() {
   local forget_output="$1"
   local key="$2"
 
-  echo "$forget_output" | jq -r --arg key "$key" '
-    if type == "object" then
-      (.[$key] // [] | length)
-    elif type == "array" then
-      ([.[] | .[$key]? // empty] | flatten | length)
-    else
-      0
-    end
-  ' 2>/dev/null | tr -d '\n' | grep -oE '^[0-9]+' || echo "0"
+  local line count
+  while IFS= read -r line; do
+    count=$(printf '%s\n' "$line" | jq -r --arg key "$key" '
+      if type == "object" and has($key) then
+        (.[$key] // [] | length)
+      elif type == "array" and any(.[]; has($key)) then
+        ([.[] | .[$key]? // empty] | flatten | length)
+      else
+        empty
+      end
+    ' 2>/dev/null) || true
+
+    if [[ "$count" =~ ^[0-9]+$ ]]; then
+      echo "$count"
+      return 0
+    fi
+  done <<< "$forget_output"
+
+  echo "0"
 }
 
 cmd_snapshot() {
